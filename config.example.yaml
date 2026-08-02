@@ -1,0 +1,59 @@
+# Copy to config.yaml and adjust. Secrets go in .env.
+
+poll_interval_sec: 60
+raw_retention_days: 14
+dashboard_url: "http://127.0.0.1:8000"
+
+# CPU temperature compensation factor (Pimoroni default ~2.25)
+temp_compensation_factor: 2.25
+
+# Alert cooldown and hysteresis (fraction of threshold span / absolute delta)
+cooldown_sec: 1800
+hysteresis:
+  temperature: 0.5
+  humidity: 2.0
+  pressure: 1.0
+  gas_reducing: 1000
+  gas_oxidising: 1000
+  gas_nh3: 1000
+  noise: 0.05
+  lux: 50
+
+# Gas sensor: wait this long after process start before relative baseline alerts
+gas:
+  baseline_warmup_min: 30
+  # Optional: alert if reading moves this % from rolling baseline (null = off)
+  relative_change_pct: null
+
+# Thresholds: null disables that side of the alert.
+# Gas values are resistance in Ohms.
+# Reducing / NH3: LOWER resistance = MORE gas -> alert when value <= high (treated as "bad" ceiling inverted).
+# For reducing/NH3 we use .high as the minimum resistance (alert when reading drops below it).
+# Oxidising: HIGHER resistance = MORE NO2-like -> alert when value >= high.
+temperature:
+  high: 28.0
+  low: 10.0
+humidity:
+  high: 70.0
+  low: 30.0
+pressure:
+  high: null
+  low: null
+gas_reducing:
+  # Alert when resistance falls below this (more reducing gases / CO-like)
+  high: null
+gas_oxidising:
+  high: null
+gas_nh3:
+  high: null
+noise:
+  high: null
+lux:
+  high: null
+  low: null
+
+# Telegram user IDs allowed to run bot commands (integers)
+telegram_allowlist: []
+
+# Send a one-shot Telegram message when the collector starts
+notify_on_startup: true

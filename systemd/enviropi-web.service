@@ -1,0 +1,18 @@
+[Unit]
+Description=EnviroPi web dashboard
+After=network-online.target enviropi-collector.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+Group=pi
+WorkingDirectory=/home/pi/enviropi
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=-/home/pi/enviropi/.env
+ExecStart=/home/pi/enviropi/.venv/bin/enviropi-web
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

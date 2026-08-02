@@ -1,0 +1,62 @@
+{% extends "base.html" %}
+{% block title %}Dashboard · EnviroPi{% endblock %}
+{% block content %}
+<section class="hero-dash">
+  <div>
+    <h1>Dashboard</h1>
+    <p class="lede">Live readings and history{% if user %} · {{ user.email }}{% endif %}</p>
+  </div>
+  <div class="range-tabs" role="tablist">
+    {% for r in ranges %}
+    <a class="tab {% if r == range %}active{% endif %}" href="/?range={{ r }}">{{ r }}</a>
+    {% endfor %}
+  </div>
+</section>
+
+<section class="metrics" id="metrics">
+  {% set fields = [
+    ('temperature', 'Temp', '°C'),
+    ('humidity', 'Humidity', '%'),
+    ('pressure', 'Pressure', 'hPa'),
+    ('lux', 'Light', 'lux'),
+    ('noise', 'Noise', ''),
+    ('gas_reducing', 'Reducing', 'Ω'),
+    ('gas_oxidising', 'Oxidising', 'Ω'),
+    ('gas_nh3', 'NH3', 'Ω'),
+  ] %}
+  {% if latest %}
+    {% for key, label, unit in fields %}
+    <div class="metric">
+      <span class="label">{{ label }}</span>
+      <span class="value" data-metric="{{ key }}">{{ '%.1f'|format(latest[key]) if latest[key] is not none else '—' }}</span>
+      <span class="unit">{{ unit }}</span>
+    </div>
+    {% endfor %}
+    <p class="meta">Updated <time id="latest-ts" datetime="{{ latest.ts }}">{{ latest.ts }}</time></p>
+  {% else %}
+    <p class="lede">No samples yet. Start the collector.</p>
+  {% endif %}
+</section>
+
+<section class="charts">
+  <div class="chart-block">
+    <h2>Climate</h2>
+    <canvas id="chart-climate" height="120"></canvas>
+  </div>
+  <div class="chart-block">
+    <h2>Gases (Ω)</h2>
+    <canvas id="chart-gas" height="120"></canvas>
+  </div>
+  <div class="chart-block">
+    <h2>Light &amp; noise</h2>
+    <canvas id="chart-ambient" height="120"></canvas>
+  </div>
+</section>
+{% endblock %}
+{% block scripts %}
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.6/dist/chart.umd.min.js"></script>
+<script>
+  window.ENVIROPI_RANGE = {{ range|tojson }};
+</script>
+<script src="/static/dashboard.js"></script>
+{% endblock %}

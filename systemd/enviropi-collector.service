@@ -1,0 +1,18 @@
+[Unit]
+Description=EnviroPi sensor collector and Telegram bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+Group=pi
+WorkingDirectory=/home/pi/enviropi
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=-/home/pi/enviropi/.env
+ExecStart=/home/pi/enviropi/.venv/bin/enviropi-collector
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

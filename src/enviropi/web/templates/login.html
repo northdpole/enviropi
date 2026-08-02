@@ -1,0 +1,16 @@
+{% extends "base.html" %}
+{% block title %}Sign in · EnviroPi{% endblock %}
+{% block content %}
+<section class="login">
+  <h1>EnviroPi</h1>
+  <p class="lede">Indoor climate and gas monitoring for your Enviro+.</p>
+  {% if error %}
+  <p class="error" role="alert">{{ error }}</p>
+  {% endif %}
+  {% if oauth_configured %}
+  <a class="btn primary" href="/auth/login">Continue with Google</a>
+  {% else %}
+  <p class="error">Google OAuth is not configured. Set <code>GOOGLE_CLIENT_ID</code> and <code>GOOGLE_CLIENT_SECRET</code> in <code>.env</code>.</p>
+  {% endif %}
+</section>
+{% endblock %}

@@ -1,0 +1,48 @@
+{% extends "base.html" %}
+{% block title %}Settings · EnviroPi{% endblock %}
+{% block content %}
+<section class="hero-dash">
+  <div>
+    <h1>Settings</h1>
+    <p class="lede">Defaults come from <code>config.yaml</code>. Values you save here override them (same store as Telegram <code>/set</code>).</p>
+  </div>
+</section>
+
+{% if saved %}
+<p class="ok" role="status">Saved.</p>
+{% endif %}
+
+<form method="post" action="/settings" class="settings-form">
+  <div class="settings-grid">
+    {% for key in keys %}
+    <label class="field">
+      <span>{{ key }}</span>
+      <input
+        name="{{ key }}"
+        value="{% if key in overrides %}{{ overrides[key] }}{% endif %}"
+        placeholder="{% if effective[key] is not none %}{{ effective[key] }} (config){% else %}null (off){% endif %}"
+        inputmode="decimal"
+      >
+      <small>{% if key in overrides %}active override{% else %}using config default — enter a value to override{% endif %}</small>
+    </label>
+    {% endfor %}
+  </div>
+
+  <fieldset class="mute-box">
+    <legend>Mute alerts</legend>
+    <label class="field">
+      <span>Mute for hours</span>
+      <input name="mute_hours" type="number" step="0.5" min="0" placeholder="e.g. 2">
+    </label>
+    <label class="check">
+      <input type="checkbox" name="unmute" value="1"> Clear mute now
+    </label>
+    {% if overrides.get('mute_until') %}
+    <p class="meta">Currently muted until {{ overrides['mute_until'] }}</p>
+    {% endif %}
+  </fieldset>
+
+  <p class="hint">Clear a field and save, or type <code>default</code>, to remove an override.</p>
+  <button type="submit" class="btn primary">Save overrides</button>
+</form>
+{% endblock %}
