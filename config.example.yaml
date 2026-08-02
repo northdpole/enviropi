@@ -2,8 +2,9 @@
 
 poll_interval_sec: 60
 raw_retention_days: 14
-# Public link used in Telegram alerts (Tailscale MagicDNS; not loopback)
-dashboard_url: "http://enviropi.example.ts.net:8000"
+# Public link used in Telegram alerts. Prefer ENVIROPI_TAILSCALE_HOST / ENVIROPI_DASHBOARD_URL
+# in .env so personal MagicDNS is not committed; this is only a fallback default.
+dashboard_url: "http://127.0.0.1:8000"
 
 # CPU temperature compensation factor (Pimoroni default ~2.25)
 temp_compensation_factor: 2.25
@@ -53,8 +54,7 @@ lux:
   high: null
   low: null
 
-# Telegram numeric user IDs allowed to run bot commands (not @username).
-# For a private chat, this is the same number as TELEGRAM_ALERT_CHAT_ID.
+# Prefer TELEGRAM_ALLOWLIST / TELEGRAM_ALERT_CHAT_ID in .env (not personal ids here).
 # If empty, a positive TELEGRAM_ALERT_CHAT_ID is auto-allowed for commands.
 telegram_allowlist: []
 

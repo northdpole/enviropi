@@ -4,7 +4,13 @@ from datetime import timedelta
 from pathlib import Path
 
 from enviropi.alerts import AlertEvaluator
-from enviropi.config import AppConfig, merge_overrides
+from enviropi.config import (
+    AppConfig,
+    EnvSettings,
+    get_config,
+    merge_overrides,
+    parse_telegram_allowlist,
+)
 from enviropi.db import Database, Sample, to_iso, utc_now
 from enviropi.display import DisplaySnapshot, create_display
 from enviropi.sensors import MockSensorReader, Reading
@@ -135,6 +141,30 @@ def test_effective_telegram_allowlist_owner_only():
     assert effective_telegram_allowlist([111], "1112223334") == {111, 1112223334}
     # Stranger never implied
     assert 999 not in effective_telegram_allowlist([], "1112223334")
+
+
+def test_parse_telegram_allowlist_env():
+    assert parse_telegram_allowlist("") == []
+    assert parse_telegram_allowlist("6346565051") == [6346565051]
+    assert parse_telegram_allowlist("111, 222") == [111, 222]
+    assert parse_telegram_allowlist("bad,333") == [333]
+
+
+def test_get_config_merges_env_identity(tmp_path: Path, monkeypatch):
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text(
+        "dashboard_url: \"http://127.0.0.1:8000\"\ntelegram_allowlist: []\n"
+    )
+    monkeypatch.chdir(tmp_path)
+    env = EnvSettings(
+        enviropi_config=cfg_path,
+        enviropi_tailscale_host="enviropi.example.ts.net",
+        telegram_allowlist="111,222",
+        web_port=8000,
+    )
+    cfg = get_config(env)
+    assert cfg.dashboard_url == "http://enviropi.example.ts.net:8000"
+    assert cfg.telegram_allowlist == [111, 222]
 
 
 def test_rollup_and_prune(tmp_path: Path):

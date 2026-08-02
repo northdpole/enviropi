@@ -102,18 +102,21 @@ sudo apt-get install -y libopenblas0 libportaudio2
    cp .env.example .env
    ```
 
-   Set in `.env`:
+   Set in `.env` (personal identity stays here — not in committed `config.yaml`):
 
+   - `ENVIROPI_SERVICE_USER` (systemd `User=`/`Group=`; `push-to-pi.sh` rewrites units)
+   - `ENVIROPI_TAILSCALE_HOST` (MagicDNS host → `dashboard_url` + OAuth redirect base)
    - `ENVIROPI_MOCK_SENSORS=false`
    - `DISPLAY_ENABLED=true` (proximity-wake LCD; `false` leaves backlight alone)
    - `DASHBOARD_ENABLED=true` (or `false` to run collector only)
-   - `TELEGRAM_BOT_TOKEN`, `TELEGRAM_ALERT_CHAT_ID`
+   - `TELEGRAM_BOT_TOKEN`, `TELEGRAM_ALERT_CHAT_ID`, optional `TELEGRAM_ALLOWLIST`
    - `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `OAUTH_REDIRECT_URI`, `OAUTH_ALLOWLIST`
    - `SESSION_SECRET` (long random string)
    - `ENVIROPI_DB=/opt/embedded-stack/apps/enviropi/data/enviropi.db`
 
-5. In `config.yaml`, set `telegram_allowlist` to your Telegram numeric user id(s), and
-   `dashboard_url` to the Tailscale MagicDNS URL (e.g. `http://enviropi.example.ts.net:8000`).
+5. Leave `telegram_allowlist: []` and a generic `dashboard_url` in `config.yaml`;
+   runtime merges `TELEGRAM_ALLOWLIST` / private `TELEGRAM_ALERT_CHAT_ID` and
+   `ENVIROPI_TAILSCALE_HOST` (or `ENVIROPI_DASHBOARD_URL`) from `.env`.
 
 6. Install systemd units (drafts live under `/opt/embedded-stack/systemd/`):
 
@@ -153,11 +156,12 @@ Google requires a registered redirect URI matching `OAUTH_REDIRECT_URI`.
 
 1. Create a bot with [@BotFather](https://t.me/BotFather); put the token in `.env`.
 2. Open a chat with the bot and send any message (required before alerts can be delivered).
-3. Find your **numeric user id** (e.g. `@userinfobot` or `getUpdates`) → `TELEGRAM_ALERT_CHAT_ID`.
+3. Find your **numeric user id** (e.g. `@userinfobot` or `getUpdates`) → `TELEGRAM_ALERT_CHAT_ID`
+   and optionally `TELEGRAM_ALLOWLIST` (comma-separated). Prefer `.env` over `config.yaml`.
    In a private chat this id equals your user id. Group chat ids are negative and only receive alerts.
-4. Set `telegram_allowlist` in `config.yaml` to your numeric user id(s). Empty allowlist does **not**
-   open the bot: only a positive `TELEGRAM_ALERT_CHAT_ID` (private chat) is auto-allowed for commands.
-   Everyone else gets `Unauthorized.` Alerts are only sent to `TELEGRAM_ALERT_CHAT_ID`.
+4. Empty YAML allowlist does **not** open the bot: a positive `TELEGRAM_ALERT_CHAT_ID` (private chat)
+   and/or `TELEGRAM_ALLOWLIST` authorize commands. Everyone else gets `Unauthorized.`
+   Alerts are only sent to `TELEGRAM_ALERT_CHAT_ID`.
 
 Commands (owner allowlist / private alert recipient only):
 

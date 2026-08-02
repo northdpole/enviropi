@@ -10,30 +10,49 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
-HOST="${1:-${ENVIROPI_HOST:-}}"
+# Load local .env for deploy identity (does not override already-exported vars)
+if [[ -f "$ROOT/.env" ]]; then
+  set -a
+  # shellcheck disable=SC1091
+  source "$ROOT/.env"
+  set +a
+fi
+
 APP_REMOTE="${ENVIROPI_REMOTE_APP:-/opt/embedded-stack/apps/enviropi}"
 OUT_DIR="${ENVIROPI_DIST:-$ROOT/dist}"
 VENV_DIR="${ENVIROPI_VENV_DIR:-$OUT_DIR/venv-armv6}"
 TARBALL="${ENVIROPI_VENV_TARBALL:-$OUT_DIR/enviropi-venv-armv6l.tar.gz}"
 SSH_BIN="${ENVIROPI_SSH:-ssh}"
 RSYNC_BIN="${ENVIROPI_RSYNC:-rsync}"
+WEB_PORT="${WEB_PORT:-8000}"
 
 die() { printf 'push-to-pi: %s\n' "$*" >&2; exit 1; }
 
-[[ -n "$HOST" ]] || die "missing host. Usage: $0 user@enviropi.example.ts.net"
+# SSH target: arg > ENVIROPI_HOST > SERVICE_USER@TAILSCALE_HOST
+HOST="${1:-${ENVIROPI_HOST:-}}"
+if [[ -z "$HOST" && -n "${ENVIROPI_TAILSCALE_HOST:-}" ]]; then
+  HOST="${ENVIROPI_SERVICE_USER:-pi}@${ENVIROPI_TAILSCALE_HOST}"
+fi
+[[ -n "$HOST" ]] || die "missing host. Set ENVIROPI_HOST / ENVIROPI_TAILSCALE_HOST in .env or: $0 user@host"
 command -v "$RSYNC_BIN" >/dev/null || die "rsync not found"
 command -v "$SSH_BIN" >/dev/null || die "ssh not found"
 
 # Deploy-time identity (unit files ship as User=pi; override for this Pi)
 if [[ "$HOST" == *@* ]]; then
   SERVICE_USER="${ENVIROPI_SERVICE_USER:-${HOST%%@*}}"
-  REMOTE_FQDN="${HOST#*@}"
+  REMOTE_FQDN="${ENVIROPI_TAILSCALE_HOST:-${HOST#*@}}"
 else
   SERVICE_USER="${ENVIROPI_SERVICE_USER:-pi}"
-  REMOTE_FQDN="$HOST"
+  REMOTE_FQDN="${ENVIROPI_TAILSCALE_HOST:-$HOST}"
 fi
-DASHBOARD_URL="${ENVIROPI_DASHBOARD_URL:-http://${REMOTE_FQDN}:8000}"
-OAUTH_REDIRECT_URI="${ENVIROPI_OAUTH_REDIRECT_URI:-${DASHBOARD_URL%/}/auth/callback}"
+DASHBOARD_URL="${ENVIROPI_DASHBOARD_URL:-http://${REMOTE_FQDN}:${WEB_PORT}}"
+OAUTH_REDIRECT_URI="${ENVIROPI_OAUTH_REDIRECT_URI:-${OAUTH_REDIRECT_URI:-${DASHBOARD_URL%/}/auth/callback}}"
+# Prefer deploy-derived OAuth URI so localhost leftovers in .env do not win on Pi
+if [[ "$OAUTH_REDIRECT_URI" == *"127.0.0.1"* || "$OAUTH_REDIRECT_URI" == *"localhost"* ]]; then
+  OAUTH_REDIRECT_URI="${DASHBOARD_URL%/}/auth/callback"
+fi
+TELEGRAM_ALLOWLIST="${TELEGRAM_ALLOWLIST:-${TELEGRAM_ALERT_CHAT_ID:-}}"
+TELEGRAM_ALLOWLIST="$(printf '%s' "$TELEGRAM_ALLOWLIST" | tr -d '[:space:]')"
 
 if [[ ! -d "$VENV_DIR/bin" && -f "$TARBALL" ]]; then
   echo "push-to-pi: extracting $TARBALL"
@@ -75,6 +94,7 @@ echo "push-to-pi: syncing project -> ${HOST}:${APP_REMOTE}"
 
 "$RSYNC_BIN" -az --delete \
   --exclude '.venv/' \
+  --exclude '.venv.new/' \
   --exclude '.venv-armv6/' \
   --exclude '.git/' \
   --exclude 'data/' \
@@ -86,16 +106,21 @@ echo "push-to-pi: syncing project -> ${HOST}:${APP_REMOTE}"
   --exclude '.env' \
   "$ROOT/" "${HOST}:${APP_REMOTE}/"
 
-echo "push-to-pi: syncing prebuilt venv"
+echo "push-to-pi: syncing prebuilt venv (tar stream; more reliable than rsync on Pi Zero)"
 "$SSH_BIN" "$HOST" "rm -rf $(printf '%q' "$APP_REMOTE")/.venv.new && mkdir -p $(printf '%q' "$APP_REMOTE")/.venv.new"
-"$RSYNC_BIN" -az --delete "$VENV_DIR/" "${HOST}:${APP_REMOTE}/.venv.new/"
+# Stream a tarball so partial directory trees cannot race with --delete mkstemp failures.
+tar -C "$VENV_DIR" -czf - . | "$SSH_BIN" "$HOST" \
+  "tar -C $(printf '%q' "$APP_REMOTE")/.venv.new -xzf -"
 
 # Remote activate: swap venv, rewrite shebangs, apt runtime libs, systemd
 "$SSH_BIN" "$HOST" \
   "APP=$(printf '%q' "$APP_REMOTE") \
    SERVICE_USER=$(printf '%q' "$SERVICE_USER") \
+   TAILSCALE_HOST=$(printf '%q' "$REMOTE_FQDN") \
    DASHBOARD_URL=$(printf '%q' "$DASHBOARD_URL") \
    OAUTH_REDIRECT_URI=$(printf '%q' "$OAUTH_REDIRECT_URI") \
+   TELEGRAM_ALLOWLIST=$(printf '%q' "$TELEGRAM_ALLOWLIST") \
+   WEB_PORT=$(printf '%q' "$WEB_PORT") \
    bash -s" <<'EOF'
 set -euo pipefail
 cd "$APP"
@@ -160,13 +185,25 @@ for line in lines:
 updates = {
     "ENVIROPI_MOCK_SENSORS": "false",
     "ENVIROPI_DB": "/opt/embedded-stack/apps/enviropi/data/enviropi.db",
+    "ENVIROPI_SERVICE_USER": os.environ["SERVICE_USER"],
+    "ENVIROPI_TAILSCALE_HOST": os.environ["TAILSCALE_HOST"],
+    "ENVIROPI_DASHBOARD_URL": os.environ["DASHBOARD_URL"],
     "DISPLAY_ENABLED": "true",
     # Tailscale-reachable dashboard (UFW should allow only on tailscale0)
     "DASHBOARD_ENABLED": "true",
     "WEB_HOST": "0.0.0.0",
-    "WEB_PORT": "8000",
+    "WEB_PORT": os.environ.get("WEB_PORT") or "8000",
     "OAUTH_REDIRECT_URI": os.environ["OAUTH_REDIRECT_URI"],
 }
+allow = (os.environ.get("TELEGRAM_ALLOWLIST") or "").strip()
+if allow:
+    updates["TELEGRAM_ALLOWLIST"] = allow
+    # Keep alert chat id aligned when only allowlist was set from it
+    if not (kv.get("TELEGRAM_ALERT_CHAT_ID") or "").strip():
+        # First positive-looking id from allowlist
+        first = allow.split(",")[0].strip()
+        if first.lstrip("-").isdigit() and not first.startswith("-"):
+            updates["TELEGRAM_ALERT_CHAT_ID"] = first
 for k, v in updates.items():
     if k not in kv:
         order.append(("kv", k))
@@ -185,7 +222,7 @@ PY
 if [[ ! -f config.yaml && -f config.example.yaml ]]; then
   cp config.example.yaml config.yaml
 fi
-# Ensure Telegram/alert links use deploy-time dashboard URL (preserve other YAML)
+# dashboard_url / telegram_allowlist come from .env at runtime; keep YAML generic
 python3 - <<'PY'
 import os
 import re
@@ -193,6 +230,7 @@ from pathlib import Path
 p = Path("config.yaml")
 text = p.read_text() if p.exists() else ""
 url = os.environ["DASHBOARD_URL"]
+# Keep a sensible YAML fallback matching deploy host (env still wins via get_config)
 new = re.sub(
     r'(?m)^dashboard_url:\s*.*$',
     f'dashboard_url: "{url}"',
@@ -201,8 +239,18 @@ new = re.sub(
 )
 if new == text and "dashboard_url" not in text:
     new = f'dashboard_url: "{url}"\n' + text
-p.write_text(new)
+# Scrub personal Telegram ids from committed-style YAML; use TELEGRAM_ALLOWLIST in .env
+new2 = re.sub(
+    r'(?m)^telegram_allowlist:\s*.*$',
+    "telegram_allowlist: []",
+    new,
+    count=1,
+)
+if new2 == new and "telegram_allowlist" not in new:
+    new2 = new.rstrip() + "\ntelegram_allowlist: []\n"
+p.write_text(new2)
 print("dashboard_url_ok", url)
+print("telegram_allowlist_yaml_cleared")
 PY
 mkdir -p data
 

@@ -81,8 +81,16 @@ class EnvSettings(BaseSettings):
     enviropi_config: Path = Path("./config.yaml")
     enviropi_db: Path = Path("./data/enviropi.db")
     enviropi_mock_sensors: bool = True
+    # Deploy identity (also used by push-to-pi.sh). App uses host for dashboard_url.
+    enviropi_service_user: str = ""
+    enviropi_tailscale_host: str = ""
+    # Optional full URL override; else derived from ENVIROPI_TAILSCALE_HOST + WEB_PORT.
+    enviropi_dashboard_url: str = ""
     telegram_bot_token: str = ""
     telegram_alert_chat_id: str = ""
+    # Comma-separated Telegram numeric user ids for bot commands (optional;
+    # private TELEGRAM_ALERT_CHAT_ID is also auto-allowed).
+    telegram_allowlist: str = ""
     google_client_id: str = ""
     google_client_secret: str = ""
     oauth_redirect_uri: str = "http://127.0.0.1:8000/auth/callback"
@@ -98,6 +106,22 @@ class EnvSettings(BaseSettings):
     @property
     def oauth_emails(self) -> set[str]:
         return {e.strip().lower() for e in self.oauth_allowlist.split(",") if e.strip()}
+
+
+def parse_telegram_allowlist(raw: str | None) -> list[int]:
+    """Parse TELEGRAM_ALLOWLIST=id1,id2 into integer user ids."""
+    if not raw:
+        return []
+    out: list[int] = []
+    for part in str(raw).split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            out.append(int(part))
+        except ValueError:
+            continue
+    return out
 
 
 def load_yaml_config(path: Path) -> AppConfig:
@@ -151,7 +175,25 @@ def get_env() -> EnvSettings:
 
 def get_config(env: EnvSettings | None = None) -> AppConfig:
     env = env or get_env()
-    return load_yaml_config(env.enviropi_config)
+    cfg = load_yaml_config(env.enviropi_config)
+    updates: dict[str, Any] = {}
+
+    env_ids = parse_telegram_allowlist(env.telegram_allowlist)
+    if env_ids:
+        merged = list(dict.fromkeys([*cfg.telegram_allowlist, *env_ids]))
+        updates["telegram_allowlist"] = merged
+
+    dash = (env.enviropi_dashboard_url or "").strip()
+    if dash:
+        updates["dashboard_url"] = dash.rstrip("/")
+    else:
+        host = (env.enviropi_tailscale_host or "").strip()
+        if host:
+            updates["dashboard_url"] = f"http://{host}:{env.web_port}"
+
+    if updates:
+        cfg = cfg.model_copy(update=updates)
+    return cfg
 
 
 def effective_threshold_map(cfg: AppConfig, overrides: dict[str, str]) -> dict[str, Any]:

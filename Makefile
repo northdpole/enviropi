@@ -1,6 +1,7 @@
 # Mac-side armv6 cross-build / push helpers (Docker on Mac, not on the Pi).
-# Primary: make build && make push HOST=user@pi
-# Fallback: make pack-venv HOST=user@pi && make push HOST=user@pi
+# Primary: make build && make push
+# HOST optional — defaults from .env ENVIROPI_HOST or ENVIROPI_SERVICE_USER@ENVIROPI_TAILSCALE_HOST
+# Fallback: make pack-venv && make push
 .PHONY: build push pack-venv
 
 build:
