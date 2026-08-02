@@ -1,0 +1,11 @@
+.git
+.venv
+.venv-armv6
+dist
+data
+.env
+*.db
+.pytest_cache
+__pycache__
+*.pyc
+.DS_Store

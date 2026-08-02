@@ -88,6 +88,10 @@ class EnvSettings(BaseSettings):
     oauth_redirect_uri: str = "http://127.0.0.1:8000/auth/callback"
     oauth_allowlist: str = ""
     session_secret: str = "change-me"
+    # When false, enviropi-web exits without binding; collector keeps running.
+    dashboard_enabled: bool = True
+    # Enviro+ LCD: proximity-wake only (not permanently on). Ignored when mock.
+    display_enabled: bool = True
     web_host: str = "127.0.0.1"
     web_port: int = 8000
 

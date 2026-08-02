@@ -7,11 +7,11 @@ Wants=network-online.target
 Type=simple
 User=pi
 Group=pi
-WorkingDirectory=/home/pi/enviropi
+WorkingDirectory=/opt/embedded-stack/apps/enviropi
 Environment=PYTHONUNBUFFERED=1
-EnvironmentFile=-/home/pi/enviropi/.env
-ExecStart=/home/pi/enviropi/.venv/bin/enviropi-collector
-Restart=on-failure
+EnvironmentFile=-/opt/embedded-stack/apps/enviropi/.env
+ExecStart=/opt/embedded-stack/apps/enviropi/.venv/bin/enviropi-collector
+Restart=always
 RestartSec=5
 
 [Install]

@@ -6,10 +6,79 @@ from datetime import timedelta
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-from enviropi.config import OVERRIDE_KEYS, AppConfig, effective_threshold_map, merge_overrides
+from enviropi.config import OVERRIDE_KEYS, AppConfig, effective_threshold_map
 from enviropi.db import Database, to_iso, utc_now
 
 logger = logging.getLogger(__name__)
+
+HELP_TEXT = (
+    "EnviroPi bot ready.\n"
+    "Commands:\n"
+    "/help — this message\n"
+    "/status — latest readings + threshold refs\n"
+    "/alerts — effective thresholds\n"
+    "/set <key> <value> — override threshold\n"
+    "/reset <key> — clear override\n"
+    "/mute [hours] — silence alerts\n"
+    "/unmute — resume alerts"
+)
+
+
+def _fmt_ref(value: object) -> str:
+    if value is None:
+        return "off"
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value)
+
+
+def format_status_lines(sample: dict, thresholds: dict) -> list[str]:
+    """Latest readings with effective low/high reference thresholds."""
+
+    def line(label: str, value: object, unit: str, key: str) -> str:
+        low = thresholds.get(f"{key}.low")
+        high = thresholds.get(f"{key}.high")
+        # Gas / noise only define .high in config (still show low=off).
+        return (
+            f"{label}: {value}{unit} "
+            f"({_fmt_ref(low)} low, {_fmt_ref(high)} hi)"
+        )
+
+    return [
+        f"Latest @ {sample['ts']}",
+        line("Temp", sample["temperature"], " °C", "temperature"),
+        line("Humidity", sample["humidity"], " %", "humidity"),
+        line("Pressure", sample["pressure"], " hPa", "pressure"),
+        line("Lux", sample["lux"], "", "lux"),
+        line("Noise", sample["noise"], "", "noise"),
+        line("Reducing", sample["gas_reducing"], " Ω", "gas_reducing"),
+        line("Oxidising", sample["gas_oxidising"], " Ω", "gas_oxidising"),
+        line("NH3", sample["gas_nh3"], " Ω", "gas_nh3"),
+    ]
+
+
+def private_alert_user_id(alert_chat_id: str | None) -> int | None:
+    """If alert_chat_id is a private chat, return that user id (equals chat id).
+
+    Telegram private chats use a positive id identical to the user's id.
+    Groups/supergroups use negative ids and cannot be mapped to one user.
+    """
+    if not alert_chat_id:
+        return None
+    try:
+        cid = int(str(alert_chat_id).strip())
+    except (TypeError, ValueError):
+        return None
+    return cid if cid > 0 else None
+
+
+def effective_telegram_allowlist(allowlist: list[int], alert_chat_id: str | None) -> set[int]:
+    """Command allowlist: configured user ids plus private alert recipient."""
+    result = set(allowlist)
+    alert_uid = private_alert_user_id(alert_chat_id)
+    if alert_uid is not None:
+        result.add(alert_uid)
+    return result
 
 
 class TelegramService:
@@ -25,12 +94,24 @@ class TelegramService:
         self.alert_chat_id = alert_chat_id
         self.db = db
         self.base_config = base_config
-        self.allowlist = set(allowlist)
+        configured = set(allowlist)
+        self.allowlist = effective_telegram_allowlist(allowlist, alert_chat_id)
+        if not configured and self.allowlist:
+            logger.info(
+                "telegram_allowlist empty; auto-allowing private TELEGRAM_ALERT_CHAT_ID user %s",
+                next(iter(self.allowlist)),
+            )
+        elif not self.allowlist:
+            logger.warning(
+                "telegram_allowlist is empty and TELEGRAM_ALERT_CHAT_ID is not a "
+                "private user chat; denying commands until configured"
+            )
         self.app: Application | None = None
 
     def build(self) -> Application:
         app = Application.builder().token(self.token).build()
         app.add_handler(CommandHandler("start", self.cmd_start))
+        app.add_handler(CommandHandler("help", self.cmd_help))
         app.add_handler(CommandHandler("status", self.cmd_status))
         app.add_handler(CommandHandler("alerts", self.cmd_alerts))
         app.add_handler(CommandHandler("set", self.cmd_set))
@@ -44,30 +125,41 @@ class TelegramService:
         user = update.effective_user
         if user is None:
             return False
-        if not self.allowlist:
-            logger.warning("telegram_allowlist is empty; denying commands")
-            return False
         return user.id in self.allowlist
 
     async def _deny(self, update: Update) -> None:
-        if update.message:
-            await update.message.reply_text("Unauthorized.")
+        if not update.message:
+            return
+        user = update.effective_user
+        logger.warning(
+            "Telegram command denied for user_id=%s (allowlist empty=%s)",
+            user.id if user else None,
+            not self.allowlist,
+        )
+        await update.message.reply_text("Unauthorized.")
 
     async def send_message(self, text: str) -> None:
         if not self.app or not self.alert_chat_id:
             logger.warning("Cannot send Telegram message: app/chat not configured")
             return
-        await self.app.bot.send_message(chat_id=self.alert_chat_id, text=text)
+        try:
+            await self.app.bot.send_message(chat_id=self.alert_chat_id, text=text)
+        except Exception:
+            logger.exception("Telegram send failed (chat_id=%s)", self.alert_chat_id)
 
     async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._authorized(update):
             await self._deny(update)
             return
         assert update.message
-        await update.message.reply_text(
-            "EnviroPi bot ready.\n"
-            "Commands: /status /alerts /set /reset /mute /unmute"
-        )
+        await update.message.reply_text(HELP_TEXT)
+
+    async def cmd_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._authorized(update):
+            await self._deny(update)
+            return
+        assert update.message
+        await update.message.reply_text(HELP_TEXT)
 
     async def cmd_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._authorized(update):
@@ -78,18 +170,10 @@ class TelegramService:
         if not sample:
             await update.message.reply_text("No samples yet.")
             return
-        lines = [
-            f"Latest @ {sample['ts']}",
-            f"Temp: {sample['temperature']} °C",
-            f"Humidity: {sample['humidity']} %",
-            f"Pressure: {sample['pressure']} hPa",
-            f"Lux: {sample['lux']}",
-            f"Noise: {sample['noise']}",
-            f"Reducing: {sample['gas_reducing']} Ω",
-            f"Oxidising: {sample['gas_oxidising']} Ω",
-            f"NH3: {sample['gas_nh3']} Ω",
-        ]
-        await update.message.reply_text("\n".join(lines))
+        thresholds = effective_threshold_map(self.base_config, self.db.get_overrides())
+        await update.message.reply_text(
+            "\n".join(format_status_lines(sample, thresholds))
+        )
 
     async def cmd_alerts(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._authorized(update):

@@ -84,7 +84,6 @@ class EnviroPlusSensorReader(SensorReader):
             from smbus2 import SMBus
             from ltr559 import LTR559
             from enviroplus import gas
-            from enviroplus.noise import Noise
         except ImportError as exc:
             raise RuntimeError(
                 "Hardware libraries not installed. Install enviroplus extras "
@@ -95,7 +94,15 @@ class EnviroPlusSensorReader(SensorReader):
         self._bme280 = BME280(i2c_dev=self._bus)
         self._ltr559 = LTR559()
         self._gas = gas
-        self._noise = Noise()
+        # Noise needs PortAudio (libportaudio2). Optional on headless Pi Zero —
+        # enviroplus.noise imports sounddevice which raises OSError if missing.
+        self._noise = None
+        try:
+            from enviroplus.noise import Noise
+
+            self._noise = Noise()
+        except Exception as exc:
+            logger.warning("Noise sensor unavailable (%s); continuing without it", exc)
         # Prime CPU temp buffer
         for _ in range(5):
             self._cpu_temps.append(self._cpu_temperature())
@@ -119,14 +126,21 @@ class EnviroPlusSensorReader(SensorReader):
         # When covered, lux reading is unreliable — treat as near-zero like Pimoroni examples
         lux = 1.0 if proximity >= 10 else float(self._ltr559.get_lux())
         gases = self._gas.read_all()
-        # Noise: low/mid/high/amp — use overall amplitude
-        low, mid, high, amp = self._noise.get_noise_profile()
+        noise = 0.0
+        if self._noise is not None:
+            try:
+                # Noise: low/mid/high/amp — use overall amplitude
+                _low, _mid, _high, amp = self._noise.get_noise_profile()
+                noise = float(amp)
+            except Exception as exc:
+                logger.warning("Noise read failed (%s); disabling noise", exc)
+                self._noise = None
         return Reading(
             temperature=round(self._compensated_temperature(), 2),
             humidity=round(float(self._bme280.get_humidity()), 2),
             pressure=round(float(self._bme280.get_pressure()), 2),
             lux=round(lux, 1),
-            noise=round(float(amp), 4),
+            noise=round(noise, 4),
             gas_reducing=round(float(gases.reducing), 1),
             gas_oxidising=round(float(gases.oxidising), 1),
             gas_nh3=round(float(gases.nh3), 1),

@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from enviropi.alerts import AlertEvaluator
 from enviropi.config import get_config, get_env
 from enviropi.db import Database
+from enviropi.display import create_display
 from enviropi.sensors import create_sensor_reader
 from enviropi.telegram_bot import TelegramService
 
@@ -26,9 +27,19 @@ class Collector:
         self.db = Database(self.env.enviropi_db)
         self.sensors = create_sensor_reader(self.config, self.env.enviropi_mock_sensors)
         self.evaluator = AlertEvaluator(self.db, self.config)
+        self.display = None
         self.telegram: TelegramService | None = None
         self._stop = asyncio.Event()
         self._last_rollup_day: str | None = None
+
+        try:
+            self.display = create_display(
+                enabled=self.env.display_enabled,
+                mock_sensors=self.env.enviropi_mock_sensors,
+            )
+        except Exception:
+            logger.exception("LCD init failed; continuing without display")
+            self.display = None
 
         if self.env.telegram_bot_token:
             self.telegram = TelegramService(
@@ -77,6 +88,8 @@ class Collector:
                 except asyncio.TimeoutError:
                     pass
         finally:
+            if self.display:
+                await asyncio.to_thread(self.display.stop)
             if self.telegram and self.telegram.app:
                 app = self.telegram.app
                 if app.updater:
@@ -94,6 +107,8 @@ class Collector:
             reading = await asyncio.to_thread(self.sensors.read)
             sample = reading.to_sample()
             self.db.insert_sample(sample)
+            if self.display:
+                self.display.update(reading)
             logger.info(
                 "Sample T=%.1f H=%.1f P=%.1f lux=%.0f",
                 sample.temperature or 0,

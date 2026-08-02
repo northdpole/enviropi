@@ -7,10 +7,11 @@ Wants=network-online.target
 Type=simple
 User=pi
 Group=pi
-WorkingDirectory=/home/pi/enviropi
+WorkingDirectory=/opt/embedded-stack/apps/enviropi
 Environment=PYTHONUNBUFFERED=1
-EnvironmentFile=-/home/pi/enviropi/.env
-ExecStart=/home/pi/enviropi/.venv/bin/enviropi-web
+EnvironmentFile=-/opt/embedded-stack/apps/enviropi/.env
+ExecStart=/opt/embedded-stack/apps/enviropi/.venv/bin/enviropi-web
+# Exit 0 when DASHBOARD_ENABLED=false — do not restart in that case.
 Restart=on-failure
 RestartSec=5
 

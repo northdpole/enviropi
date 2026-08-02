@@ -231,6 +231,8 @@ def create_app() -> FastAPI:
 
 
 def main() -> None:
+    import sys
+
     import uvicorn
 
     logging.basicConfig(
@@ -238,6 +240,12 @@ def main() -> None:
         format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
     )
     env = get_env()
+    if not env.dashboard_enabled:
+        logger.info(
+            "Dashboard disabled (DASHBOARD_ENABLED=false); not binding HTTP. "
+            "Collector can keep running separately."
+        )
+        sys.exit(0)
     uvicorn.run(
         "enviropi.web.app:create_app",
         factory=True,
