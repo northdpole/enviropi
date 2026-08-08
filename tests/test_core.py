@@ -268,7 +268,7 @@ def test_effective_telegram_allowlist_owner_only():
 
 def test_parse_telegram_allowlist_env():
     assert parse_telegram_allowlist("") == []
-    assert parse_telegram_allowlist("6346565051") == [6346565051]
+    assert parse_telegram_allowlist("9998887776") == [9998887776]
     assert parse_telegram_allowlist("111, 222") == [111, 222]
     assert parse_telegram_allowlist("bad,333") == [333]
 

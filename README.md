@@ -40,7 +40,17 @@ You can hit `/healthz` and run the collector with mocks. Chart APIs require a lo
 Pi Zero is **armv6l / armhf**. Prefer building the Python venv on your Mac in an emulated
 `linux/arm/v6` container, then pushing it — the Pi should not compile wheels.
 
-### Fast path (Mac Docker → Pi over Tailscale)
+### Fast path (Mac → Pi, app code only)
+
+After the Pi already has a working `.venv` (from a prior full push):
+
+```bash
+# Build pure-Python wheel locally, sync wheel + units, restart services (~1 min)
+./scripts/push-to-pi.sh
+# or: make push
+```
+
+### Full path (Mac Docker venv → Pi)
 
 Prereqs on the Mac: Docker/Colima, `docker buildx`, QEMU binfmt (`tonistiigi/binfmt`).
 
@@ -48,24 +58,24 @@ Prereqs on the Mac: Docker/Colima, `docker buildx`, QEMU binfmt (`tonistiigi/bin
 # One-time on Mac (Colima): register arm emulators
 docker run --rm --privileged tonistiigi/binfmt --install arm
 
-# Primary: emulated armv6 build (Raspberry Pi OS Trixie / Python 3.13)
+# Emulated armv6 venv (Raspberry Pi OS Trixie / Python 3.13)
 make build
 # or: ./scripts/build-armv6.sh
 # → dist/venv-armv6/ + dist/enviropi-venv-armv6l.tar.gz
 
-# Push code + prebuilt venv (no Docker / heavy pip on Pi)
-./scripts/push-to-pi.sh user@enviropi.example.ts.net
-# or: make push HOST=user@enviropi.example.ts.net
+# Push prebuilt venv + install app wheel (first install / dependency changes)
+./scripts/push-to-pi.sh --full
+# or: make push-full
 ```
 
-`push-to-pi.sh` compares the venv’s Python minor to remote `python3` and **refuses** a
+`push-to-pi.sh --full` compares the venv’s Python minor to remote `python3` and **refuses** a
 mismatch (e.g. old 3.11 bookworm artifact vs Pi Trixie 3.13).
 
 **Fallback** if QEMU build is impractical: seed once from a working Pi, then push:
 
 ```bash
 ./scripts/pack-venv-from-pi.sh user@enviropi.example.ts.net
-./scripts/push-to-pi.sh user@enviropi.example.ts.net
+./scripts/push-to-pi.sh --full user@enviropi.example.ts.net
 ```
 
 **Base image:** `vascoguita/raspios:armhf-trixie` (`linux/arm/v6`). Override with
@@ -148,7 +158,7 @@ Google requires a registered redirect URI matching `OAUTH_REDIRECT_URI`.
 2. Authorized redirect URI: `http://enviropi.example.ts.net:8000/auth/callback`
    (or HTTPS if you put a tunnel/proxy in front).
 3. Put the client in **Testing** mode and add your Google account as a test user, or publish the app.
-4. Set `OAUTH_ALLOWLIST=you@gmail.com` (comma-separated).
+4. Set `OAUTH_ALLOWLIST=you@example.com` (comma-separated).
 5. On the Pi, bind all interfaces (`WEB_HOST=0.0.0.0`) and restrict exposure with UFW on
    `tailscale0` only (see above).
 

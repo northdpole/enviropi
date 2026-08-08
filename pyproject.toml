@@ -34,6 +34,7 @@ hardware = [
 ]
 dev = [
     "pytest>=8.0",
+    "build>=1.2.0",
 ]
 
 [project.scripts]

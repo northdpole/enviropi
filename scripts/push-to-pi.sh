@@ -1,10 +1,15 @@
 #!/usr/bin/env bash
-# Push EnviroPi app + prebuilt armv6 venv to a Pi over SSH/rsync (no heavy pip on Pi).
-# Usage: ./scripts/push-to-pi.sh [user@]host
+# Deploy EnviroPi to a Pi over SSH/rsync.
 #
-# Primary: Docker-built dist/venv-armv6 from ./scripts/build-armv6.sh
-# Fallback: same paths filled by ./scripts/pack-venv-from-pi.sh (Pi-seeded cache)
-# Refuses to install when venv Python minor ≠ remote python3 minor.
+# Modes:
+#   --app   (default) Build a pure-Python wheel locally, sync that + unit files,
+#           pip install --no-deps on the Pi, restart services. Seconds, not minutes.
+#   --full  Also replace the prebuilt armv6 venv (deps / Python / first install).
+#
+# Usage:
+#   ./scripts/push-to-pi.sh [--app|--full] [user@]host
+#
+# Full-mode venv: dist/venv-armv6 from ./scripts/build-armv6.sh (or pack-venv-from-pi).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -25,11 +30,39 @@ TARBALL="${ENVIROPI_VENV_TARBALL:-$OUT_DIR/enviropi-venv-armv6l.tar.gz}"
 SSH_BIN="${ENVIROPI_SSH:-ssh}"
 RSYNC_BIN="${ENVIROPI_RSYNC:-rsync}"
 WEB_PORT="${WEB_PORT:-8000}"
+MODE="${ENVIROPI_PUSH_MODE:-app}"
 
 die() { printf 'push-to-pi: %s\n' "$*" >&2; exit 1; }
 
+usage() {
+  cat <<'USAGE'
+Usage: ./scripts/push-to-pi.sh [--app|--full] [user@]host
+
+  --app   Fast path (default): local wheel → Pi install → restart
+  --full  Slow path: sync prebuilt armv6 venv + app (deps / first install)
+
+Host defaults from ENVIROPI_HOST / ENVIROPI_SERVICE_USER@ENVIROPI_TAILSCALE_HOST.
+USAGE
+}
+
+HOST=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --app) MODE=app; shift ;;
+    --full) MODE=full; shift ;;
+    -h|--help) usage; exit 0 ;;
+    -*)
+      die "unknown option: $1 (try --help)"
+      ;;
+    *)
+      HOST="$1"
+      shift
+      ;;
+  esac
+done
+
 # SSH target: arg > ENVIROPI_HOST > SERVICE_USER@TAILSCALE_HOST
-HOST="${1:-${ENVIROPI_HOST:-}}"
+HOST="${HOST:-${ENVIROPI_HOST:-}}"
 if [[ -z "$HOST" && -n "${ENVIROPI_TAILSCALE_HOST:-}" ]]; then
   HOST="${ENVIROPI_SERVICE_USER:-pi}@${ENVIROPI_TAILSCALE_HOST}"
 fi
@@ -54,89 +87,47 @@ fi
 TELEGRAM_ALLOWLIST="${TELEGRAM_ALLOWLIST:-${TELEGRAM_ALERT_CHAT_ID:-}}"
 TELEGRAM_ALLOWLIST="$(printf '%s' "$TELEGRAM_ALLOWLIST" | tr -d '[:space:]')"
 
-if [[ ! -d "$VENV_DIR/bin" && -f "$TARBALL" ]]; then
-  echo "push-to-pi: extracting $TARBALL"
-  mkdir -p "$OUT_DIR"
-  tar -C "$OUT_DIR" -xzf "$TARBALL"
-fi
-[[ -x "$VENV_DIR/bin/python" || -x "$VENV_DIR/bin/python3" ]] \
-  || die "missing prebuilt venv at ${VENV_DIR} (run ./scripts/build-armv6.sh or ./scripts/pack-venv-from-pi.sh)"
+remote_ssh() {
+  "$SSH_BIN" -o BatchMode=yes "$HOST" "$@"
+}
 
-# --- Python minor must match remote system python3 ---
-venv_mm=""
-if [[ -f "$VENV_DIR/.enviropi-python-mm" ]]; then
-  venv_mm="$(tr -d '[:space:]' <"$VENV_DIR/.enviropi-python-mm")"
-elif [[ -f "$VENV_DIR/.enviropi-python" ]]; then
-  # e.g. "3.13.5 (main, …)" → 3.13
-  venv_mm="$(sed -n 's/^[[:space:]]*\([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' "$VENV_DIR/.enviropi-python" | head -1)"
-elif [[ -f "$VENV_DIR/pyvenv.cfg" ]]; then
-  venv_mm="$(sed -n 's/^version_info[[:space:]]*=[[:space:]]*\([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' "$VENV_DIR/pyvenv.cfg" | head -1)"
-  if [[ -z "$venv_mm" ]]; then
-    venv_mm="$(sed -n 's/^version[[:space:]]*=[[:space:]]*\([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' "$VENV_DIR/pyvenv.cfg" | head -1)"
-  fi
-fi
-[[ -n "$venv_mm" ]] || die "cannot determine venv Python version (missing .enviropi-python-mm); rebuild with ./scripts/build-armv6.sh"
+ensure_remote_layout() {
+  remote_ssh "mkdir -p $(printf '%q' "$APP_REMOTE")/data $(printf '%q' "$APP_REMOTE")/dist"
+}
 
-remote_mm="$("$SSH_BIN" -o BatchMode=yes "$HOST" 'python3 -c "import sys; print(f\"{sys.version_info.major}.{sys.version_info.minor}\")"')"
-remote_mm="$(tr -d '[:space:]' <<<"$remote_mm")"
-[[ -n "$remote_mm" ]] || die "could not read remote python3 version on ${HOST}"
-
-if [[ "$venv_mm" != "$remote_mm" ]]; then
-  die "Python mismatch: venv=${venv_mm} remote=${remote_mm}. Refusing push.
-  Rebuild for this Pi:  ./scripts/build-armv6.sh   # Trixie/3.13 armv6 default
-  Or seed from Pi:      ./scripts/pack-venv-from-pi.sh ${HOST}
-  Override paths only if you know they match: ENVIROPI_VENV_DIR=…"
-fi
-echo "push-to-pi: Python ${venv_mm} matches remote ${HOST}"
-
-echo "push-to-pi: syncing project -> ${HOST}:${APP_REMOTE}"
-"$SSH_BIN" "$HOST" "mkdir -p $(printf '%q' "$APP_REMOTE")/data"
-
-"$RSYNC_BIN" -az --delete \
-  --exclude '.venv/' \
-  --exclude '.venv.new/' \
-  --exclude '.venv-armv6/' \
-  --exclude '.git/' \
-  --exclude 'data/' \
-  --exclude 'dist/' \
-  --exclude '.pytest_cache/' \
-  --exclude '__pycache__/' \
-  --exclude '*.pyc' \
-  --exclude '.DS_Store' \
-  --exclude '.env' \
-  "$ROOT/" "${HOST}:${APP_REMOTE}/"
-
-echo "push-to-pi: syncing prebuilt venv (tar stream; more reliable than rsync on Pi Zero)"
-"$SSH_BIN" "$HOST" "rm -rf $(printf '%q' "$APP_REMOTE")/.venv.new && mkdir -p $(printf '%q' "$APP_REMOTE")/.venv.new"
-# Stream a tarball so partial directory trees cannot race with --delete mkstemp failures.
-tar -C "$VENV_DIR" -czf - . | "$SSH_BIN" "$HOST" \
-  "tar -C $(printf '%q' "$APP_REMOTE")/.venv.new -xzf -"
-
-# Remote activate: swap venv, rewrite shebangs, apt runtime libs, systemd
-"$SSH_BIN" "$HOST" \
-  "APP=$(printf '%q' "$APP_REMOTE") \
-   SERVICE_USER=$(printf '%q' "$SERVICE_USER") \
-   TAILSCALE_HOST=$(printf '%q' "$REMOTE_FQDN") \
-   DASHBOARD_URL=$(printf '%q' "$DASHBOARD_URL") \
-   OAUTH_REDIRECT_URI=$(printf '%q' "$OAUTH_REDIRECT_URI") \
-   TELEGRAM_ALLOWLIST=$(printf '%q' "$TELEGRAM_ALLOWLIST") \
-   WEB_PORT=$(printf '%q' "$WEB_PORT") \
-   bash -s" <<'EOF'
+# --- Shared remote: env/config patch + systemd restart ---
+# Args via env: APP, SERVICE_USER, TAILSCALE_HOST, DASHBOARD_URL, OAUTH_REDIRECT_URI,
+# TELEGRAM_ALLOWLIST, WEB_PORT, INSTALL_WHEEL (optional path), SKIP_APT (0/1), SWAP_VENV (0/1)
+remote_activate() {
+  local install_wheel="${1:-}"
+  local skip_apt="${2:-1}"
+  local swap_venv="${3:-0}"
+  "$SSH_BIN" "$HOST" \
+    "APP=$(printf '%q' "$APP_REMOTE") \
+     SERVICE_USER=$(printf '%q' "$SERVICE_USER") \
+     TAILSCALE_HOST=$(printf '%q' "$REMOTE_FQDN") \
+     DASHBOARD_URL=$(printf '%q' "$DASHBOARD_URL") \
+     OAUTH_REDIRECT_URI=$(printf '%q' "$OAUTH_REDIRECT_URI") \
+     TELEGRAM_ALLOWLIST=$(printf '%q' "$TELEGRAM_ALLOWLIST") \
+     WEB_PORT=$(printf '%q' "$WEB_PORT") \
+     INSTALL_WHEEL=$(printf '%q' "$install_wheel") \
+     SKIP_APT=$(printf '%q' "$skip_apt") \
+     SWAP_VENV=$(printf '%q' "$swap_venv") \
+     bash -s" <<'EOF'
 set -euo pipefail
 cd "$APP"
 
-if [[ -d .venv ]]; then mv .venv ".venv.bak.$(date +%s)"; fi
-mv .venv.new .venv
+if [[ "${SWAP_VENV}" == "1" ]]; then
+  if [[ -d .venv ]]; then mv .venv ".venv.bak.$(date +%s)"; fi
+  mv .venv.new .venv
 
-python3 - <<'PY'
+  python3 - <<'PY'
 from pathlib import Path
 venv = Path(".venv").resolve()
 bindir = venv / "bin"
 py = bindir / "python3"
 if not py.exists():
     py = bindir / "python"
-# Use the venv python path (not .resolve() through a /usr/bin symlink), so
-# pyvenv.cfg still activates site-packages when scripts run under systemd.
 shebang = f"#!{py}\n"
 for path in bindir.iterdir():
     if not path.is_file() or path.is_symlink():
@@ -159,14 +150,22 @@ for path in bindir.iterdir():
     path.chmod(0o755)
 print("shebangs_ok", py)
 PY
+fi
 
-# Ensure the app package is importable in the swapped venv
-./.venv/bin/python3 -m pip install -e . --no-deps -q
+[[ -x .venv/bin/python3 || -x .venv/bin/python ]] \
+  || { echo "push-to-pi: missing remote .venv — run with --full first" >&2; exit 1; }
+
+if [[ -n "${INSTALL_WHEEL}" ]]; then
+  ./.venv/bin/python3 -m pip install --no-deps --force-reinstall -q "${INSTALL_WHEEL}"
+else
+  ./.venv/bin/python3 -m pip install -e . --no-deps -q
+fi
 ./.venv/bin/python3 -c "import enviropi; print('enviropi_ok', enviropi.__file__)"
 
-# System shared libs used by numpy / sounddevice (not inside the venv)
-sudo apt-get update -qq
-sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq libopenblas0 libportaudio2 || true
+if [[ "${SKIP_APT}" != "1" ]]; then
+  sudo apt-get update -qq
+  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq libopenblas0 libportaudio2 || true
+fi
 
 if [[ ! -f .env ]]; then cp .env.example .env; fi
 python3 - <<'PY'
@@ -189,7 +188,6 @@ updates = {
     "ENVIROPI_TAILSCALE_HOST": os.environ["TAILSCALE_HOST"],
     "ENVIROPI_DASHBOARD_URL": os.environ["DASHBOARD_URL"],
     "DISPLAY_ENABLED": "true",
-    # Tailscale-reachable dashboard (UFW should allow only on tailscale0)
     "DASHBOARD_ENABLED": "true",
     "WEB_HOST": "0.0.0.0",
     "WEB_PORT": os.environ.get("WEB_PORT") or "8000",
@@ -198,9 +196,7 @@ updates = {
 allow = (os.environ.get("TELEGRAM_ALLOWLIST") or "").strip()
 if allow:
     updates["TELEGRAM_ALLOWLIST"] = allow
-    # Keep alert chat id aligned when only allowlist was set from it
     if not (kv.get("TELEGRAM_ALERT_CHAT_ID") or "").strip():
-        # First positive-looking id from allowlist
         first = allow.split(",")[0].strip()
         if first.lstrip("-").isdigit() and not first.startswith("-"):
             updates["TELEGRAM_ALERT_CHAT_ID"] = first
@@ -222,7 +218,6 @@ PY
 if [[ ! -f config.yaml && -f config.example.yaml ]]; then
   cp config.example.yaml config.yaml
 fi
-# dashboard_url / telegram_allowlist come from .env at runtime; keep YAML generic
 python3 - <<'PY'
 import os
 import re
@@ -230,7 +225,6 @@ from pathlib import Path
 p = Path("config.yaml")
 text = p.read_text() if p.exists() else ""
 url = os.environ["DASHBOARD_URL"]
-# Keep a sensible YAML fallback matching deploy host (env still wins via get_config)
 new = re.sub(
     r'(?m)^dashboard_url:\s*.*$',
     f'dashboard_url: "{url}"',
@@ -239,7 +233,6 @@ new = re.sub(
 )
 if new == text and "dashboard_url" not in text:
     new = f'dashboard_url: "{url}"\n' + text
-# Scrub personal Telegram ids from committed-style YAML; use TELEGRAM_ALLOWLIST in .env
 new2 = re.sub(
     r'(?m)^telegram_allowlist:\s*.*$',
     "telegram_allowlist: []",
@@ -254,7 +247,6 @@ print("telegram_allowlist_yaml_cleared")
 PY
 mkdir -p data
 
-# UFW: dashboard only via Tailscale (idempotent; default deny keeps LAN/public closed)
 if command -v ufw >/dev/null && sudo ufw status 2>/dev/null | grep -q "Status: active"; then
   if ! sudo ufw status | grep -qE '8000/tcp.*tailscale0|Anywhere on tailscale0'; then
     sudo ufw allow in on tailscale0 to any port 8000 proto tcp || true
@@ -263,7 +255,6 @@ fi
 
 sudo mkdir -p /opt/embedded-stack/systemd
 sudo cp systemd/enviropi-*.service /opt/embedded-stack/systemd/
-# Unit files ship as User=pi; rewrite for this host's service account
 sudo sed -i \
   "s/^User=.*/User=${SERVICE_USER}/; s/^Group=.*/Group=${SERVICE_USER}/" \
   /opt/embedded-stack/systemd/enviropi-*.service
@@ -272,12 +263,137 @@ sudo systemctl daemon-reload
 sudo systemctl enable enviropi-collector enviropi-web
 sudo systemctl restart enviropi-collector
 sudo systemctl restart enviropi-web
-sleep 5
+sleep 3
 echo "collector=$(systemctl is-active enviropi-collector) web=$(systemctl is-active enviropi-web)"
 echo "service_user=${SERVICE_USER}"
 echo "listen:"; ss -ltnp 2>/dev/null | grep ':8000' || true
-journalctl -u enviropi-web -n 20 --no-pager
-journalctl -u enviropi-collector -n 15 --no-pager
+journalctl -u enviropi-web -n 12 --no-pager
+journalctl -u enviropi-collector -n 12 --no-pager
 EOF
+}
 
-echo "push-to-pi: done"
+build_local_wheel() {
+  local py=""
+  if [[ -x "$ROOT/.venv/bin/python" ]]; then
+    py="$ROOT/.venv/bin/python"
+  elif [[ -x "$ROOT/.venv/bin/python3" ]]; then
+    py="$ROOT/.venv/bin/python3"
+  else
+    py="$(command -v python3)"
+  fi
+  [[ -n "$py" ]] || die "python3 not found for local wheel build"
+  echo "push-to-pi: building wheel with $py"
+  mkdir -p "$OUT_DIR"
+  rm -f "$OUT_DIR"/enviropi-*.whl
+  # Keep armv6 venv tree; only clear prior wheels / local build junk under dist/
+  "$py" -m pip install -q build
+  "$py" -m build --wheel --outdir "$OUT_DIR"
+  local wheel
+  wheel="$(ls -1 "$OUT_DIR"/enviropi-*.whl 2>/dev/null | head -1 || true)"
+  [[ -n "$wheel" && -f "$wheel" ]] || die "wheel build produced no enviropi-*.whl in ${OUT_DIR}"
+  printf '%s\n' "$wheel"
+}
+
+push_app() {
+  echo "push-to-pi: mode=app (local wheel → artifacts only)"
+  ensure_remote_layout
+  # Require an existing remote venv from a prior --full (or manual) install
+  remote_ssh "test -x $(printf '%q' "$APP_REMOTE")/.venv/bin/python3 -o -x $(printf '%q' "$APP_REMOTE")/.venv/bin/python" \
+    || die "remote .venv missing on ${HOST}. First install: $0 --full ${HOST}"
+
+  local wheel
+  wheel="$(build_local_wheel)"
+  local wheel_name
+  wheel_name="$(basename "$wheel")"
+  echo "push-to-pi: syncing ${wheel_name} + unit/config stubs"
+
+  "$RSYNC_BIN" -az \
+    "$wheel" \
+    "${HOST}:${APP_REMOTE}/dist/"
+
+  "$RSYNC_BIN" -az \
+    "$ROOT/systemd/" \
+    "${HOST}:${APP_REMOTE}/systemd/"
+
+  "$RSYNC_BIN" -az \
+    "$ROOT/config.example.yaml" \
+    "$ROOT/.env.example" \
+    "$ROOT/pyproject.toml" \
+    "${HOST}:${APP_REMOTE}/"
+
+  remote_activate "${APP_REMOTE}/dist/${wheel_name}" 1 0
+}
+
+push_full() {
+  echo "push-to-pi: mode=full (venv + tree)"
+  if [[ ! -d "$VENV_DIR/bin" && -f "$TARBALL" ]]; then
+    echo "push-to-pi: extracting $TARBALL"
+    mkdir -p "$OUT_DIR"
+    tar -C "$OUT_DIR" -xzf "$TARBALL"
+  fi
+  [[ -x "$VENV_DIR/bin/python" || -x "$VENV_DIR/bin/python3" ]] \
+    || die "missing prebuilt venv at ${VENV_DIR} (run ./scripts/build-armv6.sh or ./scripts/pack-venv-from-pi.sh)"
+
+  local venv_mm=""
+  if [[ -f "$VENV_DIR/.enviropi-python-mm" ]]; then
+    venv_mm="$(tr -d '[:space:]' <"$VENV_DIR/.enviropi-python-mm")"
+  elif [[ -f "$VENV_DIR/.enviropi-python" ]]; then
+    venv_mm="$(sed -n 's/^[[:space:]]*\([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' "$VENV_DIR/.enviropi-python" | head -1)"
+  elif [[ -f "$VENV_DIR/pyvenv.cfg" ]]; then
+    venv_mm="$(sed -n 's/^version_info[[:space:]]*=[[:space:]]*\([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' "$VENV_DIR/pyvenv.cfg" | head -1)"
+    if [[ -z "$venv_mm" ]]; then
+      venv_mm="$(sed -n 's/^version[[:space:]]*=[[:space:]]*\([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' "$VENV_DIR/pyvenv.cfg" | head -1)"
+    fi
+  fi
+  [[ -n "$venv_mm" ]] || die "cannot determine venv Python version (missing .enviropi-python-mm); rebuild with ./scripts/build-armv6.sh"
+
+  local remote_mm
+  remote_mm="$(remote_ssh 'python3 -c "import sys; print(f\"{sys.version_info.major}.{sys.version_info.minor}\")"')"
+  remote_mm="$(tr -d '[:space:]' <<<"$remote_mm")"
+  [[ -n "$remote_mm" ]] || die "could not read remote python3 version on ${HOST}"
+
+  if [[ "$venv_mm" != "$remote_mm" ]]; then
+    die "Python mismatch: venv=${venv_mm} remote=${remote_mm}. Refusing push.
+  Rebuild for this Pi:  ./scripts/build-armv6.sh
+  Or seed from Pi:      ./scripts/pack-venv-from-pi.sh ${HOST}"
+  fi
+  echo "push-to-pi: Python ${venv_mm} matches remote ${HOST}"
+
+  ensure_remote_layout
+
+  echo "push-to-pi: syncing project -> ${HOST}:${APP_REMOTE}"
+  "$RSYNC_BIN" -az --delete \
+    --exclude '.venv/' \
+    --exclude '.venv.new/' \
+    --exclude '.venv-armv6/' \
+    --exclude '.git/' \
+    --exclude 'data/' \
+    --exclude 'dist/' \
+    --exclude '.pytest_cache/' \
+    --exclude '__pycache__/' \
+    --exclude '*.pyc' \
+    --exclude '.DS_Store' \
+    --exclude '.env' \
+    --exclude 'config.yaml' \
+    "$ROOT/" "${HOST}:${APP_REMOTE}/"
+
+  echo "push-to-pi: syncing prebuilt venv (tar stream)"
+  remote_ssh "rm -rf $(printf '%q' "$APP_REMOTE")/.venv.new && mkdir -p $(printf '%q' "$APP_REMOTE")/.venv.new"
+  tar -C "$VENV_DIR" -czf - . | "$SSH_BIN" "$HOST" \
+    "tar -C $(printf '%q' "$APP_REMOTE")/.venv.new -xzf -"
+
+  local wheel
+  wheel="$(build_local_wheel)"
+  local wheel_name
+  wheel_name="$(basename "$wheel")"
+  "$RSYNC_BIN" -az "$wheel" "${HOST}:${APP_REMOTE}/dist/"
+  remote_activate "${APP_REMOTE}/dist/${wheel_name}" 0 1
+}
+
+case "$MODE" in
+  app) push_app ;;
+  full) push_full ;;
+  *) die "unknown mode: ${MODE}" ;;
+esac
+
+echo "push-to-pi: done (${MODE})"
