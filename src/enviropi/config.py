@@ -36,7 +36,8 @@ OVERRIDE_KEYS = (
     "noise.high",
     "lux.high",
     "lux.low",
-    "cooldown_sec",
+    "status_report.times",
+    "status_report.enabled",
     "mute_until",
 )
 
@@ -55,14 +56,45 @@ class GasConfig(BaseModel):
     relative_change_pct: float | None = None
 
 
+class StatusReportConfig(BaseModel):
+    """Scheduled Telegram digests with current readings."""
+
+    enabled: bool = True
+    # Local wall-clock times (HH:MM) in `timezone`
+    times: list[str] = Field(default_factory=lambda: ["08:00", "20:00"])
+    timezone: str = "Europe/London"
+
+
+class CatastropheConfig(BaseModel):
+    """Sudden rate-of-change alerts (fire / flood / extreme gas)."""
+
+    enabled: bool = True
+    window_min: int = 5
+    # Absolute rises within the window
+    temperature_rise: float = 5.0
+    humidity_rise: float = 25.0
+    # Optional sudden pressure drop (hPa); null = off
+    pressure_drop: float | None = 8.0
+    # Gas resistance % move vs sample ~window_min ago
+    gas_drop_pct: float = 35.0  # reducing / NH3: lower Ω = more gas
+    gas_rise_pct: float = 35.0  # oxidising: higher Ω = more NO2-like
+    # Optional sudden lux jump; null = off (no PM sensor — lux is a weak fire proxy)
+    lux_rise: float | None = None
+    # Suppress repeat catastrophe messages for the same metric
+    cooldown_sec: int = 600
+
+
 class AppConfig(BaseModel):
     poll_interval_sec: int = 60
     raw_retention_days: int = 14
     dashboard_url: str = "http://127.0.0.1:8000"
     temp_compensation_factor: float = 2.25
+    # Kept for older config.yaml files; threshold alerts are edge-triggered (unused).
     cooldown_sec: int = 1800
     hysteresis: dict[str, float] = Field(default_factory=dict)
     gas: GasConfig = Field(default_factory=GasConfig)
+    status_report: StatusReportConfig = Field(default_factory=StatusReportConfig)
+    catastrophe: CatastropheConfig = Field(default_factory=CatastropheConfig)
     temperature: ThresholdPair = Field(default_factory=lambda: ThresholdPair(high=28.0, low=10.0))
     humidity: ThresholdPair = Field(default_factory=lambda: ThresholdPair(high=70.0, low=30.0))
     pressure: ThresholdPair = Field(default_factory=ThresholdPair)
@@ -144,6 +176,28 @@ def _set_nested(cfg: dict[str, Any], dotted: str, value: Any) -> None:
     cur[parts[-1]] = value
 
 
+def parse_digest_times(raw: str) -> list[str]:
+    """Parse '08:00,20:00' or '8:00 20:00' into normalized HH:MM list."""
+    parts = [p.strip() for p in raw.replace(",", " ").split() if p.strip()]
+    if not parts:
+        raise ValueError("at least one HH:MM time required")
+    out: list[str] = []
+    seen: set[str] = set()
+    for part in parts:
+        try:
+            hh_s, mm_s = part.split(":", 1)
+            hh, mm = int(hh_s), int(mm_s)
+        except ValueError as exc:
+            raise ValueError(f"invalid time {part!r}; use HH:MM") from exc
+        if not (0 <= hh <= 23 and 0 <= mm <= 59):
+            raise ValueError(f"invalid time {part!r}; use HH:MM")
+        norm = f"{hh:02d}:{mm:02d}"
+        if norm not in seen:
+            seen.add(norm)
+            out.append(norm)
+    return sorted(out)
+
+
 def merge_overrides(base: AppConfig, overrides: dict[str, str]) -> AppConfig:
     """Apply SQLite string overrides on top of YAML config."""
     data = base.model_dump()
@@ -152,13 +206,25 @@ def merge_overrides(base: AppConfig, overrides: dict[str, str]) -> AppConfig:
             # Stored separately in alert flow; keep on root for effective settings display
             data["mute_until"] = raw
             continue
+        if key == "status_report_last_slot":
+            continue
         if key not in OVERRIDE_KEYS and key != "mute_until":
             continue
+        if key == "status_report.times":
+            try:
+                parsed: Any = parse_digest_times(raw)
+            except ValueError:
+                continue
+            _set_nested(data, key, parsed)
+            continue
+        if key == "status_report.enabled":
+            _set_nested(data, key, raw.lower() in ("1", "true", "yes", "on"))
+            continue
         if raw.lower() in ("null", "none", ""):
-            parsed: Any = None
+            parsed = None
         else:
             try:
-                parsed = int(raw) if key == "cooldown_sec" else float(raw)
+                parsed = float(raw)
             except ValueError:
                 parsed = raw
         _set_nested(data, key, parsed)
@@ -212,7 +278,8 @@ def effective_threshold_map(cfg: AppConfig, overrides: dict[str, str]) -> dict[s
         "noise.high": merged.noise.high,
         "lux.high": merged.lux.high,
         "lux.low": merged.lux.low,
-        "cooldown_sec": merged.cooldown_sec,
+        "status_report.times": ",".join(merged.status_report.times),
+        "status_report.enabled": merged.status_report.enabled,
         "mute_until": overrides.get("mute_until"),
     }
     return out

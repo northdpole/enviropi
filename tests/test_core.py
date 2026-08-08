@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from enviropi.alerts import AlertEvaluator
@@ -9,6 +9,7 @@ from enviropi.config import (
     EnvSettings,
     get_config,
     merge_overrides,
+    parse_digest_times,
     parse_telegram_allowlist,
 )
 from enviropi.db import Database, Sample, to_iso, utc_now
@@ -16,7 +17,9 @@ from enviropi.display import DisplaySnapshot, create_display
 from enviropi.sensors import MockSensorReader, Reading
 from enviropi.telegram_bot import (
     effective_telegram_allowlist,
+    format_digest_lines,
     format_status_lines,
+    previous_digest_start,
     private_alert_user_id,
 )
 
@@ -65,31 +68,151 @@ def test_overrides_merge(tmp_path: Path):
     assert merged.temperature.low == 10.0
 
 
-def test_alert_temperature_high(tmp_path: Path):
+def test_alert_temperature_high_edge_triggered(tmp_path: Path):
     db = Database(tmp_path / "t.db")
     cfg = AppConfig()
     cfg.temperature.high = 25.0
-    cfg.cooldown_sec = 0
+    cfg.catastrophe.enabled = False
     ev = AlertEvaluator(db, cfg)
     sample = Sample(ts=utc_now(), temperature=30.0, humidity=40.0, pressure=1013.0)
     events = ev.evaluate(sample)
     assert any(e.condition_key == "temperature.high" for e in events)
-    # cooldown / still active — second fire suppressed when cooldown > 0
-    cfg.cooldown_sec = 1800
-    ev2 = AlertEvaluator(db, cfg)
-    events2 = ev2.evaluate(sample)
+    # Still breached — no repeat notify
+    events2 = ev.evaluate(sample)
     assert events2 == []
+
+
+def test_alert_resolves_once(tmp_path: Path):
+    db = Database(tmp_path / "t.db")
+    cfg = AppConfig()
+    cfg.temperature.high = 25.0
+    cfg.hysteresis = {"temperature": 0.5}
+    cfg.catastrophe.enabled = False
+    ev = AlertEvaluator(db, cfg)
+    hot = Sample(ts=utc_now(), temperature=30.0, humidity=40.0, pressure=1013.0)
+    assert any(e.condition_key == "temperature.high" for e in ev.evaluate(hot))
+    cool = Sample(ts=utc_now(), temperature=24.0, humidity=40.0, pressure=1013.0)
+    resolved = ev.evaluate(cool)
+    assert len(resolved) == 1
+    assert resolved[0].resolved
+    assert resolved[0].condition_key == "temperature.high"
+    assert ev.evaluate(cool) == []
 
 
 def test_gas_reducing_below_floor(tmp_path: Path):
     db = Database(tmp_path / "t.db")
     cfg = AppConfig()
     cfg.gas_reducing.high = 50_000
-    cfg.cooldown_sec = 0
+    cfg.catastrophe.enabled = False
     ev = AlertEvaluator(db, cfg)
     sample = Sample(ts=utc_now(), gas_reducing=40_000.0)
     events = ev.evaluate(sample)
     assert any(e.condition_key == "gas_reducing.high" for e in events)
+
+
+def test_catastrophe_temperature_rise(tmp_path: Path):
+    db = Database(tmp_path / "t.db")
+    past = utc_now() - timedelta(minutes=5)
+    db.insert_sample(
+        Sample(ts=past, temperature=20.0, humidity=40.0, pressure=1013.0)
+    )
+    cfg = AppConfig()
+    cfg.temperature.high = 100.0  # avoid normal threshold
+    cfg.temperature.low = -50.0
+    cfg.humidity.high = 100.0
+    cfg.humidity.low = 0.0
+    cfg.catastrophe.window_min = 5
+    cfg.catastrophe.temperature_rise = 5.0
+    cfg.catastrophe.humidity_rise = 100.0
+    cfg.catastrophe.pressure_drop = None
+    cfg.catastrophe.gas_drop_pct = 100.0
+    cfg.catastrophe.gas_rise_pct = 100.0
+    ev = AlertEvaluator(db, cfg)
+    now = Sample(ts=utc_now(), temperature=26.0, humidity=40.0, pressure=1013.0)
+    events = ev.evaluate(now)
+    assert any(e.catastrophe and e.condition_key == "catastrophe.temperature" for e in events)
+    # Cooldown suppresses immediate repeat
+    assert not any(
+        e.condition_key == "catastrophe.temperature" for e in ev.evaluate(now)
+    )
+
+
+def test_due_status_slot():
+    from enviropi.collector import _due_status_slot
+    from zoneinfo import ZoneInfo
+
+    tz = ZoneInfo("Europe/London")
+    now = datetime(2026, 8, 8, 8, 0, 30, tzinfo=tz)
+    assert _due_status_slot(now, ["08:00", "20:00"], poll_interval_sec=60) == (
+        "2026-08-08 08:00"
+    )
+    later = datetime(2026, 8, 8, 8, 2, 0, tzinfo=tz)
+    assert _due_status_slot(later, ["08:00", "20:00"], poll_interval_sec=60) is None
+
+
+def test_parse_digest_times():
+    assert parse_digest_times("08:00,20:00") == ["08:00", "20:00"]
+    assert parse_digest_times("20:00 8:00") == ["08:00", "20:00"]
+    try:
+        parse_digest_times("25:00")
+        assert False, "expected ValueError"
+    except ValueError:
+        pass
+
+
+def test_previous_digest_start_wraps_midnight():
+    from zoneinfo import ZoneInfo
+
+    tz = ZoneInfo("Europe/London")
+    slot = datetime(2026, 8, 8, 8, 0, tzinfo=tz)
+    prev = previous_digest_start(slot, ["08:00", "20:00"])
+    assert prev == datetime(2026, 8, 7, 20, 0, tzinfo=tz)
+    evening = datetime(2026, 8, 8, 20, 0, tzinfo=tz)
+    assert previous_digest_start(evening, ["08:00", "20:00"]) == datetime(
+        2026, 8, 8, 8, 0, tzinfo=tz
+    )
+
+
+def test_merge_digest_times_override():
+    base = AppConfig()
+    merged = merge_overrides(base, {"status_report.times": "07:30,19:15"})
+    assert merged.status_report.times == ["07:30", "19:15"]
+    off = merge_overrides(base, {"status_report.enabled": "false"})
+    assert off.status_report.enabled is False
+
+
+def test_interval_stats_and_digest_format(tmp_path: Path):
+    db = Database(tmp_path / "t.db")
+    t0 = utc_now() - timedelta(hours=2)
+    t1 = utc_now() - timedelta(hours=1)
+    db.insert_sample(Sample(ts=t0, temperature=18.0, humidity=40.0, pressure=1010.0))
+    db.insert_sample(Sample(ts=t1, temperature=24.0, humidity=55.0, pressure=1015.0))
+    stats = db.interval_stats(since=t0 - timedelta(minutes=1), until=utc_now())
+    assert stats is not None
+    assert stats["temperature_min"] == 18.0
+    assert stats["temperature_max"] == 24.0
+    sample = {
+        "ts": to_iso(utc_now()),
+        "temperature": 22.0,
+        "humidity": 50.0,
+        "pressure": 1012.0,
+        "lux": 10.0,
+        "noise": 0.1,
+        "gas_reducing": 1.0,
+        "gas_oxidising": 1.0,
+        "gas_nh3": 1.0,
+    }
+    text = "\n".join(
+        format_digest_lines(
+            sample,
+            {"temperature.low": 10, "temperature.high": 28},
+            interval_label="20:00",
+            stats=stats,
+        )
+    )
+    assert "Since 20:00:" in text
+    assert "Temp: 18–24 °C" in text
+    assert "Humidity: 40–55 %" in text
 
 
 def test_private_alert_user_id():

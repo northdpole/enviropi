@@ -389,3 +389,38 @@ class Database:
         if not row or row["avg_val"] is None:
             return None
         return float(row["avg_val"])
+
+    def sample_near(self, *, minutes_ago: int) -> dict[str, Any] | None:
+        """Return the newest sample at or before (now - minutes_ago)."""
+        if minutes_ago <= 0:
+            return self.latest_sample()
+        target = datetime.fromtimestamp(
+            utc_now().timestamp() - minutes_ago * 60, tz=timezone.utc
+        )
+        with self.cursor() as cur:
+            row = cur.execute(
+                "SELECT * FROM samples WHERE ts <= ? ORDER BY ts DESC LIMIT 1",
+                (to_iso(target),),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def interval_stats(
+        self, *, since: datetime, until: datetime | None = None
+    ) -> dict[str, Any] | None:
+        """Min/max per metric between since (exclusive) and until (inclusive)."""
+        until = until or utc_now()
+        aggs = ", ".join(
+            f"MIN({c}) AS {c}_min, MAX({c}) AS {c}_max" for c in SAMPLE_COLUMNS
+        )
+        with self.cursor() as cur:
+            row = cur.execute(
+                f"""
+                SELECT COUNT(*) AS sample_count, {aggs}
+                FROM samples
+                WHERE ts > ? AND ts <= ?
+                """,
+                (to_iso(since), to_iso(until)),
+            ).fetchone()
+        if not row or not row["sample_count"]:
+            return None
+        return dict(row)

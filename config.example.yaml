@@ -9,8 +9,7 @@ dashboard_url: "http://127.0.0.1:8000"
 # CPU temperature compensation factor (Pimoroni default ~2.25)
 temp_compensation_factor: 2.25
 
-# Alert cooldown and hysteresis (fraction of threshold span / absolute delta)
-cooldown_sec: 1800
+# Hysteresis: how far back inside the limit before a breach is considered resolved
 hysteresis:
   temperature: 0.5
   humidity: 2.0
@@ -21,6 +20,26 @@ hysteresis:
   noise: 0.05
   lux: 50
 
+# Twice-daily Telegram digest with current readings + period highs/lows
+# Override times live via Telegram: /digest 08:00 20:00
+status_report:
+  enabled: true
+  times: ["08:00", "20:00"]
+  timezone: "Europe/London"
+
+# Immediate alerts on sudden spikes (bypasses mute). Enviro+ has no PM sensor;
+# gas resistance jumps stand in for extreme particulate / smoke-like events.
+catastrophe:
+  enabled: true
+  window_min: 5
+  temperature_rise: 5.0      # °C within window → possible fire / extreme heat
+  humidity_rise: 25.0        # %RH within window → possible flooding / steam
+  pressure_drop: 8.0         # hPa drop within window (null to disable)
+  gas_drop_pct: 35.0         # reducing / NH3 resistance drop %
+  gas_rise_pct: 35.0         # oxidising resistance rise %
+  lux_rise: null             # optional lux jump; null = off
+  cooldown_sec: 600          # min seconds between repeat catastrophe msgs per metric
+
 # Gas sensor: wait this long after process start before relative baseline alerts
 gas:
   baseline_warmup_min: 30
@@ -28,6 +47,7 @@ gas:
   relative_change_pct: null
 
 # Thresholds: null disables that side of the alert.
+# Limit alerts fire once on breach and once when resolved (not every poll).
 # Gas values are resistance in Ohms.
 # Reducing / NH3: LOWER resistance = MORE gas -> alert when value <= high (treated as "bad" ceiling inverted).
 # For reducing/NH3 we use .high as the minimum resistance (alert when reading drops below it).

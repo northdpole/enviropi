@@ -17,6 +17,8 @@ class AlertEvent:
     message: str
     value: float
     threshold: float
+    resolved: bool = False
+    catastrophe: bool = False
 
 
 # Metrics where "high" means reading rose above threshold
@@ -31,6 +33,17 @@ HIGH_IS_BAD = {
 
 # Metrics where "high" config means resistance floor: alert when reading DROPS below
 LOW_RESISTANCE_IS_BAD = {"gas_reducing", "gas_nh3"}
+
+UNITS = {
+    "temperature": "°C",
+    "humidity": "%",
+    "pressure": "hPa",
+    "gas_reducing": "Ω",
+    "gas_oxidising": "Ω",
+    "gas_nh3": "Ω",
+    "noise": "",
+    "lux": "lux",
+}
 
 
 def _parse_mute_until(overrides: dict[str, str]) -> datetime | None:
@@ -56,15 +69,24 @@ class AlertEvaluator:
     def evaluate(self, sample: Sample) -> list[AlertEvent]:
         cfg, overrides = self._cfg()
         mute_until = _parse_mute_until(overrides)
-        if mute_until and utc_now() < mute_until:
+        muted = bool(mute_until and utc_now() < mute_until)
+        if muted:
             logger.debug("Alerts muted until %s", mute_until.isoformat())
-            return []
 
+        events: list[AlertEvent] = []
+        if not muted:
+            events.extend(self._evaluate_thresholds(cfg, sample))
+
+        # Catastrophe always evaluated; bypasses mute (fire / flood / extreme gas)
+        if cfg.catastrophe.enabled:
+            events.extend(self._evaluate_catastrophe(cfg, sample))
+
+        return events
+
+    def _evaluate_thresholds(self, cfg: AppConfig, sample: Sample) -> list[AlertEvent]:
         events: list[AlertEvent] = []
         checks: list[tuple[str, float | None, float | None, str]] = []
 
-        # (condition_key, value, threshold, direction)
-        # direction: "above" | "below"
         def add_pair(metric: str, high: float | None, low: float | None, value: float | None) -> None:
             if value is None:
                 return
@@ -103,6 +125,9 @@ class AlertEvaluator:
                 change = abs(value - baseline) / abs(baseline) * 100.0
                 if change >= pct:
                     checks.append((f"{metric}.relative", value, baseline, "relative"))
+                else:
+                    # Allow recovery path when change has subsided
+                    checks.append((f"{metric}.relative", value, baseline, "relative_ok"))
 
         for condition_key, value, threshold, direction in checks:
             event = self._maybe_fire(cfg, condition_key, value, threshold, direction)
@@ -110,6 +135,169 @@ class AlertEvaluator:
                 events.append(event)
 
         return events
+
+    def _evaluate_catastrophe(self, cfg: AppConfig, sample: Sample) -> list[AlertEvent]:
+        cat = cfg.catastrophe
+        past = self.db.sample_near(minutes_ago=cat.window_min)
+        if not past:
+            return []
+
+        events: list[AlertEvent] = []
+        window = cat.window_min
+
+        def maybe(
+            key: str,
+            metric: str,
+            current: float | None,
+            prior: float | None,
+            *,
+            delta: float | None,
+            kind: str,
+            hint: str,
+        ) -> None:
+            if current is None or prior is None or delta is None:
+                return
+            if kind == "rise" and (current - prior) < delta:
+                return
+            if kind == "drop" and (prior - current) < delta:
+                return
+            if kind == "pct_drop":
+                if prior == 0 or ((prior - current) / abs(prior) * 100.0) < delta:
+                    return
+            if kind == "pct_rise":
+                if prior == 0 or ((current - prior) / abs(prior) * 100.0) < delta:
+                    return
+
+            unit = UNITS.get(metric, "")
+            if kind.startswith("pct"):
+                change = abs(current - prior) / abs(prior) * 100.0
+                detail = f"{change:.0f}% change in {window} min ({prior:g}{unit} → {current:g}{unit})"
+                thresh = float(delta)
+            else:
+                signed = current - prior
+                detail = f"{signed:+.1f}{unit} in {window} min (now {current:g}{unit})"
+                thresh = float(delta)
+
+            event = self._maybe_catastrophe_fire(
+                cfg,
+                condition_key=f"catastrophe.{key}",
+                value=current,
+                threshold=thresh,
+                detail=detail,
+                hint=hint,
+            )
+            if event:
+                events.append(event)
+
+        maybe(
+            "temperature",
+            "temperature",
+            sample.temperature,
+            past.get("temperature"),
+            delta=cat.temperature_rise,
+            kind="rise",
+            hint="Possible fire / extreme heat",
+        )
+        maybe(
+            "humidity",
+            "humidity",
+            sample.humidity,
+            past.get("humidity"),
+            delta=cat.humidity_rise,
+            kind="rise",
+            hint="Possible flooding / steam / water event",
+        )
+        maybe(
+            "pressure",
+            "pressure",
+            sample.pressure,
+            past.get("pressure"),
+            delta=cat.pressure_drop,
+            kind="drop",
+            hint="Sudden pressure drop",
+        )
+        maybe(
+            "gas_reducing",
+            "gas_reducing",
+            sample.gas_reducing,
+            past.get("gas_reducing"),
+            delta=cat.gas_drop_pct,
+            kind="pct_drop",
+            hint="Extreme reducing-gas spike (smoke / CO-like)",
+        )
+        maybe(
+            "gas_nh3",
+            "gas_nh3",
+            sample.gas_nh3,
+            past.get("gas_nh3"),
+            delta=cat.gas_drop_pct,
+            kind="pct_drop",
+            hint="Extreme NH3 / related gas spike",
+        )
+        maybe(
+            "gas_oxidising",
+            "gas_oxidising",
+            sample.gas_oxidising,
+            past.get("gas_oxidising"),
+            delta=cat.gas_rise_pct,
+            kind="pct_rise",
+            hint="Extreme oxidising-gas spike (NO2-like)",
+        )
+        maybe(
+            "lux",
+            "lux",
+            sample.lux,
+            past.get("lux"),
+            delta=cat.lux_rise,
+            kind="rise",
+            hint="Sudden light surge",
+        )
+
+        return events
+
+    def _maybe_catastrophe_fire(
+        self,
+        cfg: AppConfig,
+        *,
+        condition_key: str,
+        value: float,
+        threshold: float,
+        detail: str,
+        hint: str,
+    ) -> AlertEvent | None:
+        state = self.db.get_alert_state(condition_key) or {}
+        last_fired = state.get("last_fired_at")
+        now = utc_now()
+        if last_fired:
+            try:
+                last_dt = datetime.fromisoformat(last_fired)
+                if (now - last_dt).total_seconds() < cfg.catastrophe.cooldown_sec:
+                    self.db.upsert_alert_state(
+                        condition_key, last_value=value, active=True
+                    )
+                    return None
+            except ValueError:
+                pass
+
+        msg = (
+            f"EnviroPi CATASTROPHE: {condition_key.split('.', 1)[1]}\n"
+            f"{detail}.\n"
+            f"{hint}.\n"
+            f"Dashboard: {cfg.dashboard_url}"
+        )
+        self.db.upsert_alert_state(
+            condition_key,
+            last_fired_at=to_iso(now),
+            last_value=value,
+            active=True,
+        )
+        return AlertEvent(
+            condition_key,
+            msg,
+            value,
+            threshold,
+            catastrophe=True,
+        )
 
     def _maybe_fire(
         self,
@@ -123,7 +311,6 @@ class AlertEvaluator:
         hyst = cfg.hysteresis.get(metric, 0.0)
         state = self.db.get_alert_state(condition_key) or {}
         was_active = bool(state.get("active"))
-        last_fired = state.get("last_fired_at")
 
         if direction == "above":
             breached = value >= threshold
@@ -131,37 +318,41 @@ class AlertEvaluator:
         elif direction == "below":
             breached = value <= threshold
             recovered = value > (threshold + hyst)
-        else:  # relative
-            breached = True  # already filtered
+        elif direction == "relative":
+            breached = True
             recovered = False
+        elif direction == "relative_ok":
+            breached = False
+            recovered = True
+        else:
+            return None
 
         now = utc_now()
         if breached:
-            if was_active and last_fired:
-                try:
-                    last_dt = datetime.fromisoformat(last_fired)
-                    if (now - last_dt).total_seconds() < cfg.cooldown_sec:
-                        self.db.upsert_alert_state(
-                            condition_key, last_value=value, active=True
-                        )
-                        return None
-                except ValueError:
-                    pass
-
-            # First breach or cooldown elapsed
-            msg = self._format_message(condition_key, value, threshold, direction, cfg)
             self.db.upsert_alert_state(
                 condition_key,
-                last_fired_at=to_iso(now),
                 last_value=value,
                 active=True,
+                last_fired_at=to_iso(now) if not was_active else None,
             )
+            if was_active:
+                # Still breached — edge-triggered: do not re-notify
+                return None
+            msg = self._format_message(condition_key, value, threshold, direction, cfg)
             return AlertEvent(condition_key, msg, value, threshold)
 
         if was_active and recovered:
             self.db.upsert_alert_state(condition_key, last_value=value, active=False)
             logger.info("Condition cleared: %s", condition_key)
-        elif not breached:
+            unit = UNITS.get(metric, "")
+            msg = (
+                f"EnviroPi resolved: {condition_key}\n"
+                f"Value {value:g}{unit} is back within limits.\n"
+                f"Dashboard: {cfg.dashboard_url}"
+            )
+            return AlertEvent(condition_key, msg, value, threshold, resolved=True)
+
+        if not breached:
             self.db.upsert_alert_state(condition_key, last_value=value, active=False)
 
         return None
@@ -174,18 +365,8 @@ class AlertEvaluator:
         direction: str,
         cfg: AppConfig,
     ) -> str:
-        units = {
-            "temperature": "°C",
-            "humidity": "%",
-            "pressure": "hPa",
-            "gas_reducing": "Ω",
-            "gas_oxidising": "Ω",
-            "gas_nh3": "Ω",
-            "noise": "",
-            "lux": "lux",
-        }
         metric = condition_key.split(".", 1)[0]
-        unit = units.get(metric, "")
+        unit = UNITS.get(metric, "")
         if direction == "relative":
             detail = f"changed vs baseline {threshold:.1f}{unit}"
         elif direction == "above":

@@ -5,19 +5,26 @@ import logging
 import signal
 import sys
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from enviropi.alerts import AlertEvaluator
-from enviropi.config import get_config, get_env
+from enviropi.config import get_config, get_env, effective_threshold_map, merge_overrides
 from enviropi.db import Database
 from enviropi.display import create_display
 from enviropi.sensors import create_sensor_reader
-from enviropi.telegram_bot import TelegramService
+from enviropi.telegram_bot import (
+    TelegramService,
+    format_digest_lines,
+    previous_digest_start,
+)
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
 )
 logger = logging.getLogger("enviropi.collector")
+
+STATUS_REPORT_SLOT_KEY = "status_report_last_slot"
 
 
 class Collector:
@@ -122,9 +129,65 @@ class Collector:
                 for event in events:
                     await self.telegram.send_message(event.message)
 
+            await self._maybe_status_report(sample.as_dict())
             self._maybe_maintain()
         except Exception:
             logger.exception("Collector tick failed")
+
+    async def _maybe_status_report(self, sample: dict) -> None:
+        overrides = self.db.get_overrides()
+        cfg = merge_overrides(self.config, overrides)
+        report = cfg.status_report
+        if not report.enabled or not self.telegram or not self.env.telegram_alert_chat_id:
+            return
+
+        try:
+            tz = ZoneInfo(report.timezone)
+        except ZoneInfoNotFoundError:
+            logger.error("Invalid status_report.timezone=%s", report.timezone)
+            return
+
+        now_local = datetime.now(tz)
+        slot = _due_status_slot(
+            now_local,
+            report.times,
+            poll_interval_sec=self.config.poll_interval_sec,
+        )
+        if not slot:
+            return
+
+        last = overrides.get(STATUS_REPORT_SLOT_KEY)
+        if last == slot:
+            return
+
+        # slot id is "YYYY-MM-DD HH:MM"
+        try:
+            date_s, time_s = slot.split(" ", 1)
+            y, mo, d = (int(x) for x in date_s.split("-"))
+            hh, mm = (int(x) for x in time_s.split(":"))
+            slot_local = datetime(y, mo, d, hh, mm, tzinfo=tz)
+        except ValueError:
+            logger.exception("Bad status report slot id %r", slot)
+            return
+
+        interval_start_local = previous_digest_start(slot_local, report.times)
+        stats = self.db.interval_stats(
+            since=interval_start_local.astimezone(timezone.utc),
+            until=slot_local.astimezone(timezone.utc),
+        )
+        thresholds = effective_threshold_map(self.config, overrides)
+        body = "\n".join(
+            format_digest_lines(
+                sample,
+                thresholds,
+                interval_label=interval_start_local.strftime("%H:%M"),
+                stats=stats,
+            )
+        )
+        text = f"EnviroPi status report ({slot})\n{body}"
+        await self.telegram.send_message(text)
+        self.db.set_override(STATUS_REPORT_SLOT_KEY, slot, "collector")
+        logger.info("Sent status report for slot %s", slot)
 
     def _maybe_maintain(self) -> None:
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -144,6 +207,27 @@ class Collector:
                 self._last_rollup_day = today
             except Exception:
                 logger.exception("Daily maintenance failed")
+
+
+def _due_status_slot(
+    now_local: datetime,
+    times: list[str],
+    *,
+    poll_interval_sec: int,
+) -> str | None:
+    """Return slot id if local time is within one poll window after a configured HH:MM."""
+    for raw in times:
+        try:
+            hh_s, mm_s = raw.strip().split(":", 1)
+            hh, mm = int(hh_s), int(mm_s)
+        except ValueError:
+            logger.warning("Ignoring invalid status_report time %r", raw)
+            continue
+        target = now_local.replace(hour=hh, minute=mm, second=0, microsecond=0)
+        delta = (now_local - target).total_seconds()
+        if 0 <= delta < poll_interval_sec:
+            return f"{now_local.date().isoformat()} {hh:02d}:{mm:02d}"
+    return None
 
 
 def main() -> None:

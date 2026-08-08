@@ -7,7 +7,7 @@ Monitor an **Enviro+** (no particulate sensor required) on a Raspberry Pi Zero: 
 - Polls temperature (CPU-compensated), humidity, pressure, lux, noise, and MICS6814 gases (reducing / oxidising / NH3)
 - Enviro+ LCD wakes on proximity (look/near), shows latest readings, then sleeps — not permanently on
 - SQLite storage: raw samples for 14 days, hourly rollups kept for a year+
-- Telegram alerts with cooldown/hysteresis; `/help`, `/status`, `/alerts`, `/set`, `/reset`, `/mute`, `/unmute`
+- Telegram: scheduled status digests (customizable via `/digest`) with period highs/lows, edge-triggered limit alerts (breach + resolve), catastrophe spike alerts; `/help`, `/status`, `/alerts`, `/digest`, `/set`, `/reset`, `/mute`, `/unmute`
 - Dashboard charts (24h / 7d / 30d / 1y) and settings UI
 - Threshold defaults in `config.yaml`; overrides from Telegram **or** dashboard (shared SQLite)
 - Google OAuth2 with email allowlist
@@ -170,12 +170,13 @@ Commands (owner allowlist / private alert recipient only):
 | `/help` | List commands |
 | `/status` | Latest readings with low/hi threshold refs |
 | `/alerts` | Effective thresholds |
+| `/digest` | Show/set status report times (`/digest 08:00 20:00`) |
 | `/set <key> <value>` | Override threshold |
 | `/reset <key>` | Clear override |
 | `/mute [hours]` | Silence alerts |
 | `/unmute` | Resume alerts |
 
-Example keys: `temperature.high`, `humidity.low`, `gas_reducing.high`, `cooldown_sec`.
+Example keys: `temperature.high`, `humidity.low`, `gas_reducing.high`, `status_report.times`.
 
 ### Gas thresholds
 
@@ -186,6 +187,15 @@ MICS6814 reports **resistance (Ω)**, not ppm:
 
 Leave gas thresholds `null` until you have a stable baseline (sensor needs warm-up; see `gas.baseline_warmup_min`). Optional `gas.relative_change_pct` alerts on % move vs a rolling baseline after warm-up.
 
+## Alert behaviour
+
+| Kind | Behaviour |
+|------|-----------|
+| Status report | At configured local times (`/digest` or `status_report.times`) with current readings plus highs/lows since the previous digest |
+| Limit breach | One Telegram message when a threshold is crossed |
+| Limit resolve | One message when the reading returns inside the limit (with hysteresis) |
+| Catastrophe | Immediate message on a sudden spike within `catastrophe.window_min` (fire / flood / extreme gas). Bypasses `/mute`. Repeat suppressed for `catastrophe.cooldown_sec` |
+
 ## Alert defaults
 
 | Condition | Default |
@@ -193,7 +203,8 @@ Leave gas thresholds `null` until you have a stable baseline (sensor needs warm-
 | Temp high / low | 28°C / 10°C |
 | Humidity high / low | 70% / 30% |
 | Pressure, gases, noise, lux | off (`null`) |
-| Cooldown | 30 minutes |
+| Status report | 08:00 and 20:00 Europe/London |
+| Catastrophe window | 5 min; +5°C / +25%RH / 35% gas swing |
 
 ## Layout
 
