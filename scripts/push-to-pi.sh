@@ -315,12 +315,13 @@ build_local_wheel() {
     py="$(command -v python3)"
   fi
   [[ -n "$py" ]] || die "python3 not found for local wheel build"
-  echo "push-to-pi: building wheel with $py"
+  # Status to stderr — stdout must be only the wheel path (rsync treats ":" as remote).
+  echo "push-to-pi: building wheel with $py" >&2
   mkdir -p "$OUT_DIR"
   rm -f "$OUT_DIR"/enviropi-*.whl
   # Keep armv6 venv tree; only clear prior wheels / local build junk under dist/
-  "$py" -m pip install -q build
-  "$py" -m build --wheel --outdir "$OUT_DIR"
+  "$py" -m pip install -q build >&2
+  "$py" -m build --wheel --outdir "$OUT_DIR" >&2
   local wheel
   wheel="$(ls -1 "$OUT_DIR"/enviropi-*.whl 2>/dev/null | head -1 || true)"
   [[ -n "$wheel" && -f "$wheel" ]] || die "wheel build produced no enviropi-*.whl in ${OUT_DIR}"
