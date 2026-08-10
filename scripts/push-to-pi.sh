@@ -222,17 +222,23 @@ python3 - <<'PY'
 import os
 import re
 from pathlib import Path
+
 p = Path("config.yaml")
 text = p.read_text() if p.exists() else ""
-url = os.environ["DASHBOARD_URL"]
+example = Path("config.example.yaml")
+ex = example.read_text() if example.exists() else ""
+
+# Keep personal MagicDNS / dashboard identity in .env only — never bake into config.yaml
+GENERIC_DASH = "http://127.0.0.1:8000"
 new = re.sub(
     r'(?m)^dashboard_url:\s*.*$',
-    f'dashboard_url: "{url}"',
+    f'dashboard_url: "{GENERIC_DASH}"',
     text,
     count=1,
 )
 if new == text and "dashboard_url" not in text:
-    new = f'dashboard_url: "{url}"\n' + text
+    new = f'dashboard_url: "{GENERIC_DASH}"\n' + text
+
 new2 = re.sub(
     r'(?m)^telegram_allowlist:\s*.*$',
     "telegram_allowlist: []",
@@ -241,9 +247,36 @@ new2 = re.sub(
 )
 if new2 == new and "telegram_allowlist" not in new:
     new2 = new.rstrip() + "\ntelegram_allowlist: []\n"
+
+# Migrate noisy historical defaults that caused Telegram chatter in warm/dry rooms
+def bump_default(src: str, key_block: str, field: str, old: str, new_val: str) -> str:
+    # Only replace when still exactly the old shipped default
+    pattern = rf'(?m)^({key_block}:\n(?:  .*\n)*?  {field}:\s*){re.escape(old)}\s*$'
+    return re.sub(pattern, rf'\g<1>{new_val}', src, count=1)
+
+new2 = bump_default(new2, "temperature", "high", "28.0", "33.0")
+new2 = bump_default(new2, "humidity", "low", "30.0", "20.0")
+new2 = bump_default(new2, "hysteresis", "temperature", "0.5", "1.5")
+new2 = bump_default(new2, "hysteresis", "humidity", "2.0", "3.0")
+
+# Ensure status_report + catastrophe blocks exist (older Pi configs predate them)
+for block in ("status_report", "catastrophe"):
+    if re.search(rf'(?m)^{block}:\s*$', new2):
+        continue
+    m = re.search(rf'(?ms)^{block}:\n(?:  .*\n)+', ex)
+    if m:
+        # Insert before gas: or temperature: section
+        insert_at = re.search(r'(?m)^(gas:|temperature:)', new2)
+        if insert_at:
+            i = insert_at.start()
+            new2 = new2[:i] + m.group(0) + "\n" + new2[i:]
+        else:
+            new2 = new2.rstrip() + "\n\n" + m.group(0)
+
 p.write_text(new2)
-print("dashboard_url_ok", url)
+print("dashboard_url_generic_ok")
 print("telegram_allowlist_yaml_cleared")
+print("alert_defaults_migrated")
 PY
 mkdir -p data
 

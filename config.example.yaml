@@ -9,10 +9,12 @@ dashboard_url: "http://127.0.0.1:8000"
 # CPU temperature compensation factor (Pimoroni default ~2.25)
 temp_compensation_factor: 2.25
 
-# Hysteresis: how far back inside the limit before a breach is considered resolved
+# Hysteresis: how far back inside the limit before a breach is considered resolved.
+# Keep temperature hysteresis wide enough that normal oscillation near the limit
+# does not spam breach/resolve Telegram messages.
 hysteresis:
-  temperature: 0.5
-  humidity: 2.0
+  temperature: 1.5
+  humidity: 3.0
   pressure: 1.0
   gas_reducing: 1000
   gas_oxidising: 1000
@@ -29,16 +31,17 @@ status_report:
 
 # Immediate alerts on sudden spikes (bypasses mute). Enviro+ has no PM sensor;
 # gas resistance jumps stand in for extreme particulate / smoke-like events.
+# Edge-triggered: one message per spike; clears when the rate-of-change subsides.
 catastrophe:
   enabled: true
   window_min: 5
   temperature_rise: 5.0      # °C within window → possible fire / extreme heat
   humidity_rise: 25.0        # %RH within window → possible flooding / steam
   pressure_drop: 8.0         # hPa drop within window (null to disable)
-  gas_drop_pct: 35.0         # reducing / NH3 resistance drop %
-  gas_rise_pct: 35.0         # oxidising resistance rise %
+  gas_drop_pct: 50.0         # reducing / NH3 resistance drop % (after warmup)
+  gas_rise_pct: 50.0         # oxidising resistance rise % (after warmup)
   lux_rise: null             # optional lux jump; null = off
-  cooldown_sec: 600          # min seconds between repeat catastrophe msgs per metric
+  cooldown_sec: 1800         # min seconds after clear before the same metric can re-fire
 
 # Gas sensor: wait this long after process start before relative baseline alerts
 gas:
@@ -53,11 +56,13 @@ gas:
 # For reducing/NH3 we use .high as the minimum resistance (alert when reading drops below it).
 # Oxidising: HIGHER resistance = MORE NO2-like -> alert when value >= high.
 temperature:
-  high: 28.0
+  # Indoor summer rooms often sit near 28–32°C; 33 avoids chatter around the limit
+  high: 33.0
   low: 10.0
 humidity:
   high: 70.0
-  low: 30.0
+  # Dry indoor air commonly sits in the mid-20s %RH
+  low: 20.0
 pressure:
   high: null
   low: null

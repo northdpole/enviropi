@@ -76,12 +76,12 @@ class CatastropheConfig(BaseModel):
     # Optional sudden pressure drop (hPa); null = off
     pressure_drop: float | None = 8.0
     # Gas resistance % move vs sample ~window_min ago
-    gas_drop_pct: float = 35.0  # reducing / NH3: lower Ω = more gas
-    gas_rise_pct: float = 35.0  # oxidising: higher Ω = more NO2-like
+    gas_drop_pct: float = 50.0  # reducing / NH3: lower Ω = more gas
+    gas_rise_pct: float = 50.0  # oxidising: higher Ω = more NO2-like
     # Optional sudden lux jump; null = off (no PM sensor — lux is a weak fire proxy)
     lux_rise: float | None = None
-    # Suppress repeat catastrophe messages for the same metric
-    cooldown_sec: int = 600
+    # After a catastrophe clears, wait this long before the same metric can fire again
+    cooldown_sec: int = 1800
 
 
 class AppConfig(BaseModel):
@@ -91,12 +91,23 @@ class AppConfig(BaseModel):
     temp_compensation_factor: float = 2.25
     # Kept for older config.yaml files; threshold alerts are edge-triggered (unused).
     cooldown_sec: int = 1800
-    hysteresis: dict[str, float] = Field(default_factory=dict)
+    hysteresis: dict[str, float] = Field(
+        default_factory=lambda: {
+            "temperature": 1.5,
+            "humidity": 3.0,
+            "pressure": 1.0,
+            "gas_reducing": 1000.0,
+            "gas_oxidising": 1000.0,
+            "gas_nh3": 1000.0,
+            "noise": 0.05,
+            "lux": 50.0,
+        }
+    )
     gas: GasConfig = Field(default_factory=GasConfig)
     status_report: StatusReportConfig = Field(default_factory=StatusReportConfig)
     catastrophe: CatastropheConfig = Field(default_factory=CatastropheConfig)
-    temperature: ThresholdPair = Field(default_factory=lambda: ThresholdPair(high=28.0, low=10.0))
-    humidity: ThresholdPair = Field(default_factory=lambda: ThresholdPair(high=70.0, low=30.0))
+    temperature: ThresholdPair = Field(default_factory=lambda: ThresholdPair(high=33.0, low=10.0))
+    humidity: ThresholdPair = Field(default_factory=lambda: ThresholdPair(high=70.0, low=20.0))
     pressure: ThresholdPair = Field(default_factory=ThresholdPair)
     gas_reducing: GasHighOnly = Field(default_factory=GasHighOnly)
     gas_oxidising: GasHighOnly = Field(default_factory=GasHighOnly)

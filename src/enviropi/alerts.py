@@ -138,12 +138,37 @@ class AlertEvaluator:
 
     def _evaluate_catastrophe(self, cfg: AppConfig, sample: Sample) -> list[AlertEvent]:
         cat = cfg.catastrophe
-        past = self.db.sample_near(minutes_ago=cat.window_min)
+        # Prior must be near the window (not hours-old pre-downtime samples).
+        past = self.db.sample_near(
+            minutes_ago=cat.window_min,
+            max_skew_min=max(2, cat.window_min // 2),
+        )
         if not past:
             return []
 
         events: list[AlertEvent] = []
         window = cat.window_min
+        warmup = cfg.gas.baseline_warmup_min * 60
+        gas_ready = (utc_now() - self._started_at).total_seconds() >= warmup
+
+        def condition_met(
+            current: float | None,
+            prior: float | None,
+            *,
+            delta: float | None,
+            kind: str,
+        ) -> bool:
+            if current is None or prior is None or delta is None:
+                return False
+            if kind == "rise":
+                return (current - prior) >= delta
+            if kind == "drop":
+                return (prior - current) >= delta
+            if kind == "pct_drop":
+                return prior != 0 and ((prior - current) / abs(prior) * 100.0) >= delta
+            if kind == "pct_rise":
+                return prior != 0 and ((current - prior) / abs(prior) * 100.0) >= delta
+            return False
 
         def maybe(
             key: str,
@@ -155,18 +180,19 @@ class AlertEvaluator:
             kind: str,
             hint: str,
         ) -> None:
-            if current is None or prior is None or delta is None:
+            condition_key = f"catastrophe.{key}"
+            met = condition_met(current, prior, delta=delta, kind=kind)
+            if not met:
+                # Edge clear — no resolve Telegram for catastrophe
+                state = self.db.get_alert_state(condition_key) or {}
+                if state.get("active"):
+                    self.db.upsert_alert_state(
+                        condition_key,
+                        last_value=current if current is not None else state.get("last_value"),
+                        active=False,
+                    )
                 return
-            if kind == "rise" and (current - prior) < delta:
-                return
-            if kind == "drop" and (prior - current) < delta:
-                return
-            if kind == "pct_drop":
-                if prior == 0 or ((prior - current) / abs(prior) * 100.0) < delta:
-                    return
-            if kind == "pct_rise":
-                if prior == 0 or ((current - prior) / abs(prior) * 100.0) < delta:
-                    return
+            assert current is not None and prior is not None and delta is not None
 
             unit = UNITS.get(metric, "")
             if kind.startswith("pct"):
@@ -180,7 +206,7 @@ class AlertEvaluator:
 
             event = self._maybe_catastrophe_fire(
                 cfg,
-                condition_key=f"catastrophe.{key}",
+                condition_key=condition_key,
                 value=current,
                 threshold=thresh,
                 detail=detail,
@@ -216,33 +242,34 @@ class AlertEvaluator:
             kind="drop",
             hint="Sudden pressure drop",
         )
-        maybe(
-            "gas_reducing",
-            "gas_reducing",
-            sample.gas_reducing,
-            past.get("gas_reducing"),
-            delta=cat.gas_drop_pct,
-            kind="pct_drop",
-            hint="Extreme reducing-gas spike (smoke / CO-like)",
-        )
-        maybe(
-            "gas_nh3",
-            "gas_nh3",
-            sample.gas_nh3,
-            past.get("gas_nh3"),
-            delta=cat.gas_drop_pct,
-            kind="pct_drop",
-            hint="Extreme NH3 / related gas spike",
-        )
-        maybe(
-            "gas_oxidising",
-            "gas_oxidising",
-            sample.gas_oxidising,
-            past.get("gas_oxidising"),
-            delta=cat.gas_rise_pct,
-            kind="pct_rise",
-            hint="Extreme oxidising-gas spike (NO2-like)",
-        )
+        if gas_ready:
+            maybe(
+                "gas_reducing",
+                "gas_reducing",
+                sample.gas_reducing,
+                past.get("gas_reducing"),
+                delta=cat.gas_drop_pct,
+                kind="pct_drop",
+                hint="Extreme reducing-gas spike (smoke / CO-like)",
+            )
+            maybe(
+                "gas_nh3",
+                "gas_nh3",
+                sample.gas_nh3,
+                past.get("gas_nh3"),
+                delta=cat.gas_drop_pct,
+                kind="pct_drop",
+                hint="Extreme NH3 / related gas spike",
+            )
+            maybe(
+                "gas_oxidising",
+                "gas_oxidising",
+                sample.gas_oxidising,
+                past.get("gas_oxidising"),
+                delta=cat.gas_rise_pct,
+                kind="pct_rise",
+                hint="Extreme oxidising-gas spike (NO2-like)",
+            )
         maybe(
             "lux",
             "lux",
@@ -265,16 +292,21 @@ class AlertEvaluator:
         detail: str,
         hint: str,
     ) -> AlertEvent | None:
+        """Edge-triggered catastrophe: one message while active; cooldown after clear."""
         state = self.db.get_alert_state(condition_key) or {}
-        last_fired = state.get("last_fired_at")
+        was_active = bool(state.get("active"))
         now = utc_now()
+
+        if was_active:
+            self.db.upsert_alert_state(condition_key, last_value=value, active=True)
+            return None
+
+        last_fired = state.get("last_fired_at")
         if last_fired:
             try:
                 last_dt = datetime.fromisoformat(last_fired)
                 if (now - last_dt).total_seconds() < cfg.catastrophe.cooldown_sec:
-                    self.db.upsert_alert_state(
-                        condition_key, last_value=value, active=True
-                    )
+                    # Post-clear cooldown: ignore new edges until it expires
                     return None
             except ValueError:
                 pass

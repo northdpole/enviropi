@@ -204,17 +204,18 @@ Leave gas thresholds `null` until you have a stable baseline (sensor needs warm-
 | Status report | At configured local times (`/digest` or `status_report.times`) with current readings plus highs/lows since the previous digest |
 | Limit breach | One Telegram message when a threshold is crossed |
 | Limit resolve | One message when the reading returns inside the limit (with hysteresis) |
-| Catastrophe | Immediate message on a sudden spike within `catastrophe.window_min` (fire / flood / extreme gas). Bypasses `/mute`. Repeat suppressed for `catastrophe.cooldown_sec` |
+| Catastrophe | Immediate message on a sudden spike within `catastrophe.window_min` (fire / flood / extreme gas). Edge-triggered (one message while active); gas checks wait for warm-up; bypasses `/mute`. After clear, re-arm wait is `catastrophe.cooldown_sec` |
 
 ## Alert defaults
 
 | Condition | Default |
 |-----------|---------|
-| Temp high / low | 28°C / 10°C |
-| Humidity high / low | 70% / 30% |
+| Temp high / low | 33°C / 10°C |
+| Humidity high / low | 70% / 20% |
+| Temp / humidity hysteresis | 1.5°C / 3% RH |
 | Pressure, gases, noise, lux | off (`null`) |
 | Status report | 08:00 and 20:00 Europe/London |
-| Catastrophe window | 5 min; +5°C / +25%RH / 35% gas swing |
+| Catastrophe window | 5 min; +5°C / +25%RH / 50% gas swing |
 
 ## Layout
 

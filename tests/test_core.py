@@ -131,10 +131,64 @@ def test_catastrophe_temperature_rise(tmp_path: Path):
     now = Sample(ts=utc_now(), temperature=26.0, humidity=40.0, pressure=1013.0)
     events = ev.evaluate(now)
     assert any(e.catastrophe and e.condition_key == "catastrophe.temperature" for e in events)
-    # Cooldown suppresses immediate repeat
+    # Still active — edge-triggered, no repeat
     assert not any(
         e.condition_key == "catastrophe.temperature" for e in ev.evaluate(now)
     )
+
+
+def test_catastrophe_rejects_stale_prior(tmp_path: Path):
+    db = Database(tmp_path / "t.db")
+    stale = utc_now() - timedelta(hours=2)
+    db.insert_sample(
+        Sample(ts=stale, temperature=20.0, humidity=40.0, pressure=1013.0)
+    )
+    cfg = AppConfig()
+    cfg.temperature.high = 100.0
+    cfg.temperature.low = -50.0
+    cfg.humidity.high = 100.0
+    cfg.humidity.low = 0.0
+    cfg.catastrophe.pressure_drop = None
+    cfg.catastrophe.gas_drop_pct = 100.0
+    cfg.catastrophe.gas_rise_pct = 100.0
+    ev = AlertEvaluator(db, cfg)
+    now = Sample(ts=utc_now(), temperature=30.0, humidity=40.0, pressure=1013.0)
+    assert ev.evaluate(now) == []
+
+
+def test_catastrophe_clears_without_rearm_spam(tmp_path: Path):
+    db = Database(tmp_path / "t.db")
+    past = utc_now() - timedelta(minutes=5)
+    db.insert_sample(
+        Sample(ts=past, temperature=20.0, humidity=40.0, pressure=1013.0)
+    )
+    cfg = AppConfig()
+    cfg.temperature.high = 100.0
+    cfg.temperature.low = -50.0
+    cfg.humidity.high = 100.0
+    cfg.humidity.low = 0.0
+    cfg.catastrophe.cooldown_sec = 3600
+    cfg.catastrophe.pressure_drop = None
+    cfg.catastrophe.gas_drop_pct = 100.0
+    cfg.catastrophe.gas_rise_pct = 100.0
+    ev = AlertEvaluator(db, cfg)
+    hot = Sample(ts=utc_now(), temperature=26.0, humidity=40.0, pressure=1013.0)
+    assert any(e.condition_key == "catastrophe.temperature" for e in ev.evaluate(hot))
+    # Condition gone → clear active silently
+    db.insert_sample(
+        Sample(ts=utc_now() - timedelta(minutes=5), temperature=25.5, humidity=40.0, pressure=1013.0)
+    )
+    cool = Sample(ts=utc_now(), temperature=26.0, humidity=40.0, pressure=1013.0)
+    assert ev.evaluate(cool) == []
+    state = db.get_alert_state("catastrophe.temperature")
+    assert state is not None and not state["active"]
+    # Spike again within cooldown → suppressed (not armed)
+    db.insert_sample(
+        Sample(ts=utc_now() - timedelta(minutes=5), temperature=20.0, humidity=40.0, pressure=1013.0)
+    )
+    again = Sample(ts=utc_now(), temperature=28.0, humidity=40.0, pressure=1013.0)
+    assert ev.evaluate(again) == []
+    assert not db.get_alert_state("catastrophe.temperature")["active"]
 
 
 def test_due_status_slot():
@@ -279,8 +333,17 @@ def test_get_config_merges_env_identity(tmp_path: Path, monkeypatch):
         "dashboard_url: \"http://127.0.0.1:8000\"\ntelegram_allowlist: []\n"
     )
     monkeypatch.chdir(tmp_path)
+    # Isolate from developer .env leaking into the process environment
+    for key in (
+        "ENVIROPI_DASHBOARD_URL",
+        "ENVIROPI_TAILSCALE_HOST",
+        "TELEGRAM_ALLOWLIST",
+        "WEB_PORT",
+    ):
+        monkeypatch.delenv(key, raising=False)
     env = EnvSettings(
         enviropi_config=cfg_path,
+        enviropi_dashboard_url="",
         enviropi_tailscale_host="enviropi.example.ts.net",
         telegram_allowlist="111,222",
         web_port=8000,

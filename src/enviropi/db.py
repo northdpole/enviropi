@@ -390,19 +390,35 @@ class Database:
             return None
         return float(row["avg_val"])
 
-    def sample_near(self, *, minutes_ago: int) -> dict[str, Any] | None:
-        """Return the newest sample at or before (now - minutes_ago)."""
+    def sample_near(
+        self, *, minutes_ago: int, max_skew_min: int | None = None
+    ) -> dict[str, Any] | None:
+        """Return the newest sample at or before (now - minutes_ago).
+
+        If max_skew_min is set, reject priors older than minutes_ago + max_skew_min
+        (avoids comparing to pre-downtime samples after a restart gap).
+        """
         if minutes_ago <= 0:
             return self.latest_sample()
-        target = datetime.fromtimestamp(
-            utc_now().timestamp() - minutes_ago * 60, tz=timezone.utc
-        )
+        now = utc_now()
+        target = datetime.fromtimestamp(now.timestamp() - minutes_ago * 60, tz=timezone.utc)
         with self.cursor() as cur:
             row = cur.execute(
                 "SELECT * FROM samples WHERE ts <= ? ORDER BY ts DESC LIMIT 1",
                 (to_iso(target),),
             ).fetchone()
-        return dict(row) if row else None
+        if not row:
+            return None
+        sample = dict(row)
+        if max_skew_min is not None:
+            try:
+                ts = datetime.fromisoformat(str(sample["ts"]).replace("Z", "+00:00"))
+            except ValueError:
+                return None
+            age_min = (now - ts).total_seconds() / 60.0
+            if age_min > minutes_ago + max_skew_min:
+                return None
+        return sample
 
     def interval_stats(
         self, *, since: datetime, until: datetime | None = None

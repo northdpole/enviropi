@@ -127,6 +127,13 @@ class Collector:
             events = self.evaluator.evaluate(sample)
             if events and self.telegram:
                 for event in events:
+                    logger.warning(
+                        "Sending %s: %s",
+                        "catastrophe" if event.catastrophe else (
+                            "resolve" if event.resolved else "alert"
+                        ),
+                        event.condition_key,
+                    )
                     await self.telegram.send_message(event.message)
 
             await self._maybe_status_report(sample.as_dict())
