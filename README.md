@@ -11,6 +11,7 @@ Monitor an **Enviro+** (no particulate sensor required) on a Raspberry Pi Zero: 
 - Dashboard charts (24h / 7d / 30d / 1y) and settings UI
 - Threshold defaults in `config.yaml`; overrides from Telegram **or** dashboard (shared SQLite)
 - Google OAuth2 with email allowlist
+- Optional MQTT publish of readings to Home Assistant (TLS + username/password)
 
 ## Quick start (dev / mock sensors)
 
@@ -123,6 +124,7 @@ sudo apt-get install -y libopenblas0 libportaudio2
    - `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `OAUTH_REDIRECT_URI`, `OAUTH_ALLOWLIST`
    - `SESSION_SECRET` (long random string)
    - `ENVIROPI_DB=/opt/embedded-stack/apps/enviropi/data/enviropi.db`
+   - MQTT (optional): `MQTT_ENABLED`, `MQTT_USERNAME`, `MQTT_PASSWORD` (never commit the password)
 
 5. Leave `telegram_allowlist: []` and a generic `dashboard_url` in `config.yaml`;
    runtime merges `TELEGRAM_ALLOWLIST` / private `TELEGRAM_ALERT_CHAT_ID` and
@@ -131,11 +133,16 @@ sudo apt-get install -y libopenblas0 libportaudio2
 6. Install systemd units (drafts live under `/opt/embedded-stack/systemd/`):
 
    ```bash
-   sudo cp systemd/enviropi-*.service /opt/embedded-stack/systemd/
-   sudo cp /opt/embedded-stack/systemd/enviropi-*.service /etc/systemd/system/
+   sudo cp systemd/enviropi-*.service systemd/enviropi-*.timer /opt/embedded-stack/systemd/
+   sudo cp /opt/embedded-stack/systemd/enviropi-*.service \
+     /opt/embedded-stack/systemd/enviropi-*.timer /etc/systemd/system/
    sudo systemctl daemon-reload
    sudo systemctl enable --now enviropi-collector enviropi-web
+   sudo systemctl enable --now enviropi-weekly-reboot.timer
    ```
+
+   `enviropi-weekly-reboot.timer` reboots the Pi Sunday ~04:00 local (before the
+   08:00 digest). It does not recover a hung kernel — that needs a hardware watchdog.
 
    Units default to `User=pi` / `Group=pi` with
    `WorkingDirectory=/opt/embedded-stack/apps/enviropi`. Override at deploy time
@@ -197,6 +204,18 @@ MICS6814 reports **resistance (Ω)**, not ppm:
 
 Leave gas thresholds `null` until you have a stable baseline (sensor needs warm-up; see `gas.baseline_warmup_min`). Optional `gas.relative_change_pct` alerts on % move vs a rolling baseline after warm-up.
 
+## MQTT (Home Assistant)
+
+The collector can publish each sample as **retained JSON** to Mosquitto. Off by default locally (`MQTT_ENABLED=false`); `push-to-pi.sh` turns it on on the Pi.
+
+- Broker: `MQTT_HOST` / `MQTT_PORT` (default `homeserver.example.ts.net:8883`)
+- TLS with the **system CA** (Let's Encrypt via Tailscale HTTPS certs). Connect to the **full** hostname so the cert SAN matches — not a short name or raw IP.
+- Username/password (not mTLS client certs). Broker user `enviropi` may **publish** `enviropi/#` only; it does not subscribe to Home Assistant topics.
+- Default topic: `enviropi/enviroplus/state` (JSON keys: `ts`, `temperature`, `humidity`, `pressure`, `lux`, `noise`, `gas_reducing`, `gas_oxidising`, `gas_nh3`)
+- `MQTT_PASSWORD` lives in `.env` on the Pi, never in git. Leave `MQTT_TLS_INSECURE=false`.
+
+MQTT failures are logged and retried; they do not stop sampling, alerts, or Telegram.
+
 ## Alert behaviour
 
 | Kind | Behaviour |
@@ -222,6 +241,7 @@ Leave gas thresholds `null` until you have a stable baseline (sensor needs warm-
 ```
 src/enviropi/
   collector.py      # poll + alerts + Telegram long-poll
+  mqtt.py           # optional TLS MQTT publisher (Home Assistant)
   sensors.py        # Enviro+ or mock
   db.py             # SQLite
   alerts.py         # threshold evaluation

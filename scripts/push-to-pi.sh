@@ -97,7 +97,7 @@ ensure_remote_layout() {
 
 # --- Shared remote: env/config patch + systemd restart ---
 # Args via env: APP, SERVICE_USER, TAILSCALE_HOST, DASHBOARD_URL, OAUTH_REDIRECT_URI,
-# TELEGRAM_ALLOWLIST, WEB_PORT, INSTALL_WHEEL (optional path), SKIP_APT (0/1), SWAP_VENV (0/1)
+# TELEGRAM_ALLOWLIST, WEB_PORT, MQTT_*, INSTALL_WHEEL (optional path), SKIP_APT (0/1), SWAP_VENV (0/1)
 remote_activate() {
   local install_wheel="${1:-}"
   local skip_apt="${2:-1}"
@@ -110,6 +110,13 @@ remote_activate() {
      OAUTH_REDIRECT_URI=$(printf '%q' "$OAUTH_REDIRECT_URI") \
      TELEGRAM_ALLOWLIST=$(printf '%q' "$TELEGRAM_ALLOWLIST") \
      WEB_PORT=$(printf '%q' "$WEB_PORT") \
+     MQTT_HOST=$(printf '%q' "${MQTT_HOST:-homeserver.example.ts.net}") \
+     MQTT_PORT=$(printf '%q' "${MQTT_PORT:-8883}") \
+     MQTT_USERNAME=$(printf '%q' "${MQTT_USERNAME:-enviropi}") \
+     MQTT_PASSWORD=$(printf '%q' "${MQTT_PASSWORD:-}") \
+     MQTT_TOPIC=$(printf '%q' "${MQTT_TOPIC:-enviropi/enviroplus/state}") \
+     MQTT_TLS=$(printf '%q' "${MQTT_TLS:-true}") \
+     MQTT_TLS_INSECURE=$(printf '%q' "${MQTT_TLS_INSECURE:-false}") \
      INSTALL_WHEEL=$(printf '%q' "$install_wheel") \
      SKIP_APT=$(printf '%q' "$skip_apt") \
      SWAP_VENV=$(printf '%q' "$swap_venv") \
@@ -192,7 +199,19 @@ updates = {
     "WEB_HOST": "0.0.0.0",
     "WEB_PORT": os.environ.get("WEB_PORT") or "8000",
     "OAUTH_REDIRECT_URI": os.environ["OAUTH_REDIRECT_URI"],
+    "MQTT_ENABLED": "true",
+    "MQTT_HOST": os.environ.get("MQTT_HOST") or "homeserver.example.ts.net",
+    "MQTT_PORT": os.environ.get("MQTT_PORT") or "8883",
+    "MQTT_USERNAME": os.environ.get("MQTT_USERNAME") or "enviropi",
+    "MQTT_TOPIC": os.environ.get("MQTT_TOPIC") or "enviropi/enviroplus/state",
+    "MQTT_TLS": os.environ.get("MQTT_TLS") or "true",
+    "MQTT_TLS_INSECURE": os.environ.get("MQTT_TLS_INSECURE") or "false",
 }
+mqtt_pw = (os.environ.get("MQTT_PASSWORD") or "").strip()
+if mqtt_pw:
+    updates["MQTT_PASSWORD"] = mqtt_pw
+elif not (kv.get("MQTT_PASSWORD") or "").strip():
+    updates["MQTT_PASSWORD"] = ""
 allow = (os.environ.get("TELEGRAM_ALLOWLIST") or "").strip()
 if allow:
     updates["TELEGRAM_ALLOWLIST"] = allow
@@ -287,17 +306,22 @@ if command -v ufw >/dev/null && sudo ufw status 2>/dev/null | grep -q "Status: a
 fi
 
 sudo mkdir -p /opt/embedded-stack/systemd
-sudo cp systemd/enviropi-*.service /opt/embedded-stack/systemd/
+sudo cp systemd/enviropi-*.service systemd/enviropi-*.timer /opt/embedded-stack/systemd/
 sudo sed -i \
   "s/^User=.*/User=${SERVICE_USER}/; s/^Group=.*/Group=${SERVICE_USER}/" \
   /opt/embedded-stack/systemd/enviropi-*.service
-sudo cp /opt/embedded-stack/systemd/enviropi-*.service /etc/systemd/system/
+sudo cp /opt/embedded-stack/systemd/enviropi-*.service \
+  /opt/embedded-stack/systemd/enviropi-*.timer \
+  /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable enviropi-collector enviropi-web
+# Timer only — do not start/restart the oneshot (that would reboot during deploy).
+sudo systemctl enable --now enviropi-weekly-reboot.timer
 sudo systemctl restart enviropi-collector
 sudo systemctl restart enviropi-web
 sleep 3
 echo "collector=$(systemctl is-active enviropi-collector) web=$(systemctl is-active enviropi-web)"
+echo "reboot_timer=$(systemctl is-enabled enviropi-weekly-reboot.timer) next=$(systemctl show enviropi-weekly-reboot.timer -p NextElapseUSecRealtime --value)"
 echo "service_user=${SERVICE_USER}"
 echo "listen:"; ss -ltnp 2>/dev/null | grep ':8000' || true
 journalctl -u enviropi-web -n 12 --no-pager

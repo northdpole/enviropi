@@ -1,0 +1,14 @@
+[Unit]
+Description=Weekly reboot timer for the EnviroPi host
+
+[Timer]
+# Local time (Pi timezone). Before the 08:00 digest; Persistent=false so a
+# missed window does not reboot immediately after a crash recovery.
+OnCalendar=Sun 04:00
+RandomizedDelaySec=15min
+AccuracySec=5min
+Persistent=false
+Unit=enviropi-weekly-reboot.service
+
+[Install]
+WantedBy=timers.target

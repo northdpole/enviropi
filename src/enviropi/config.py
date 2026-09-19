@@ -145,6 +145,15 @@ class EnvSettings(BaseSettings):
     display_enabled: bool = True
     web_host: str = "127.0.0.1"
     web_port: int = 8000
+    # MQTT publisher (collector → Mosquitto). Password lives in .env, never git.
+    mqtt_enabled: bool = False
+    mqtt_host: str = "homeserver.example.ts.net"
+    mqtt_port: int = 8883
+    mqtt_username: str = ""
+    mqtt_password: str = ""
+    mqtt_topic: str = "enviropi/enviroplus/state"
+    mqtt_tls: bool = True
+    mqtt_tls_insecure: bool = False
 
     @property
     def oauth_emails(self) -> set[str]:

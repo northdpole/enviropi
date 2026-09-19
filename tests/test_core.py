@@ -1,7 +1,10 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+import json
+import ssl
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 from enviropi.alerts import AlertEvaluator
 from enviropi.config import (
@@ -14,6 +17,7 @@ from enviropi.config import (
 )
 from enviropi.db import Database, Sample, to_iso, utc_now
 from enviropi.display import DisplaySnapshot, create_display
+from enviropi.mqtt import MqttPublisher, encode_payload
 from enviropi.sensors import MockSensorReader, Reading
 from enviropi.telegram_bot import (
     effective_telegram_allowlist,
@@ -379,3 +383,172 @@ def test_rollup_and_prune(tmp_path: Path):
     assert n >= 1
     hist = db.history(since=utc_now() - timedelta(days=1), use_hourly=True)
     assert len(hist) >= 1
+
+
+def _sample_dict() -> dict:
+    return Sample(
+        ts=datetime(2026, 9, 19, 14, 30, tzinfo=timezone.utc),
+        temperature=21.5,
+        humidity=40.0,
+        pressure=1013.0,
+        lux=100.0,
+        noise=0.1,
+        gas_reducing=80000.0,
+        gas_oxidising=40000.0,
+        gas_nh3=120000.0,
+    ).as_dict()
+
+
+def test_mqtt_payload_shape():
+    sample = _sample_dict()
+    data = json.loads(encode_payload(sample))
+    assert data == {
+        "ts": "2026-09-19T14:30:00Z",
+        "temperature": 21.5,
+        "humidity": 40.0,
+        "pressure": 1013.0,
+        "lux": 100.0,
+        "noise": 0.1,
+        "gas_reducing": 80000.0,
+        "gas_oxidising": 40000.0,
+        "gas_nh3": 120000.0,
+    }
+
+
+def test_mqtt_env_defaults():
+    fields = EnvSettings.model_fields
+    assert fields["mqtt_enabled"].default is False
+    assert fields["mqtt_host"].default == "homeserver.example.ts.net"
+    assert fields["mqtt_port"].default == 8883
+    assert fields["mqtt_topic"].default == "enviropi/enviroplus/state"
+    assert fields["mqtt_tls"].default is True
+    assert fields["mqtt_tls_insecure"].default is False
+
+
+class _FakeMqttClient:
+    """Stand-in for paho Client so tests never touch a broker."""
+
+    instances: list["_FakeMqttClient"] = []
+
+    def __init__(self, *args, **kwargs) -> None:
+        self.args = args
+        self.kwargs = kwargs
+        self.auth: tuple[str, str] | None = None
+        self.tls_kwargs: dict | None = None
+        self.tls_insecure: bool | None = None
+        self.connect_args: tuple | None = None
+        self.loop_started = False
+        self.loop_stopped = False
+        self.disconnected = False
+        self.publishes: list[dict] = []
+        self.on_connect = None
+        self.on_disconnect = None
+        type(self).instances.append(self)
+
+    def username_pw_set(self, username, password=None) -> None:
+        self.auth = (username, password)
+
+    def tls_set(self, **kwargs) -> None:
+        self.tls_kwargs = kwargs
+
+    def tls_insecure_set(self, insecure: bool) -> None:
+        self.tls_insecure = insecure
+
+    def reconnect_delay_set(self, min_delay=1, max_delay=120) -> None:
+        self.reconnect = (min_delay, max_delay)
+
+    def connect_async(self, host, port, keepalive=60) -> None:
+        self.connect_args = (host, port, keepalive)
+
+    def loop_start(self) -> None:
+        self.loop_started = True
+
+    def loop_stop(self) -> None:
+        self.loop_stopped = True
+
+    def disconnect(self) -> None:
+        self.disconnected = True
+
+    def publish(self, topic, payload, qos=0, retain=False):
+        self.publishes.append(
+            {"topic": topic, "payload": payload, "qos": qos, "retain": retain}
+        )
+        return SimpleNamespace(rc=0)
+
+
+def test_mqtt_disabled_is_noop(monkeypatch):
+    _FakeMqttClient.instances = []
+    monkeypatch.setattr("enviropi.mqtt.Client", _FakeMqttClient)
+    env = EnvSettings(
+        mqtt_enabled=False,
+        mqtt_host="homeserver.example.ts.net",
+        mqtt_port=8883,
+        mqtt_username="enviropi",
+        mqtt_password="not-used",
+        mqtt_topic="enviropi/enviroplus/state",
+        mqtt_tls=True,
+        mqtt_tls_insecure=False,
+    )
+    pub = MqttPublisher(env)
+    pub.publish(_sample_dict())
+    pub.stop()
+    assert _FakeMqttClient.instances == []
+
+
+def test_mqtt_publishes_retained_json(monkeypatch):
+    _FakeMqttClient.instances = []
+    monkeypatch.setattr("enviropi.mqtt.Client", _FakeMqttClient)
+    env = EnvSettings(
+        mqtt_enabled=True,
+        mqtt_host="homeserver.example.ts.net",
+        mqtt_port=8883,
+        mqtt_username="enviropi",
+        mqtt_password="test-password",
+        mqtt_topic="enviropi/enviroplus/state",
+        mqtt_tls=True,
+        mqtt_tls_insecure=False,
+    )
+    pub = MqttPublisher(env)
+    assert len(_FakeMqttClient.instances) == 1
+    client = _FakeMqttClient.instances[0]
+    assert client.auth == ("enviropi", "test-password")
+    assert client.connect_args == ("homeserver.example.ts.net", 8883, 60)
+    assert client.tls_kwargs is not None
+    assert client.tls_kwargs.get("cert_reqs") == ssl.CERT_REQUIRED
+    assert client.tls_insecure is False
+    assert client.loop_started is True
+
+    sample = _sample_dict()
+    pub.publish(sample)
+    assert len(client.publishes) == 1
+    sent = client.publishes[0]
+    assert sent["topic"] == "enviropi/enviroplus/state"
+    assert sent["qos"] == 1
+    assert sent["retain"] is True
+    assert json.loads(sent["payload"]) == json.loads(encode_payload(sample))
+
+    pub.stop()
+    assert client.disconnected is True
+    assert client.loop_stopped is True
+
+
+def test_mqtt_publish_failure_does_not_raise(monkeypatch):
+    class BoomClient(_FakeMqttClient):
+        def publish(self, topic, payload, qos=0, retain=False):
+            raise OSError("broker down")
+
+    BoomClient.instances = []
+    monkeypatch.setattr("enviropi.mqtt.Client", BoomClient)
+    env = EnvSettings(
+        mqtt_enabled=True,
+        mqtt_host="homeserver.example.ts.net",
+        mqtt_port=8883,
+        mqtt_username="enviropi",
+        mqtt_password="test-password",
+        mqtt_topic="enviropi/enviroplus/state",
+        mqtt_tls=True,
+        mqtt_tls_insecure=False,
+    )
+    pub = MqttPublisher(env)
+    pub.publish(_sample_dict())  # must not raise
+    pub.stop()

@@ -11,6 +11,7 @@ from enviropi.alerts import AlertEvaluator
 from enviropi.config import get_config, get_env, effective_threshold_map, merge_overrides
 from enviropi.db import Database
 from enviropi.display import create_display
+from enviropi.mqtt import MqttPublisher
 from enviropi.sensors import create_sensor_reader
 from enviropi.telegram_bot import (
     TelegramService,
@@ -36,7 +37,17 @@ class Collector:
         self.evaluator = AlertEvaluator(self.db, self.config)
         self.display = None
         self.telegram: TelegramService | None = None
+        self.mqtt = MqttPublisher(self.env)
         self._stop = asyncio.Event()
+        if self.env.mqtt_enabled:
+            creds = "ok" if self.env.mqtt_username and self.env.mqtt_password else "missing"
+            logger.info(
+                "MQTT publisher enabled host=%s:%s topic=%s credentials=%s",
+                self.env.mqtt_host,
+                self.env.mqtt_port,
+                self.env.mqtt_topic,
+                creds,
+            )
         self._last_rollup_day: str | None = None
 
         try:
@@ -95,6 +106,7 @@ class Collector:
                 except asyncio.TimeoutError:
                     pass
         finally:
+            self.mqtt.stop()
             if self.display:
                 await asyncio.to_thread(self.display.stop)
             if self.telegram and self.telegram.app:
@@ -114,6 +126,7 @@ class Collector:
             reading = await asyncio.to_thread(self.sensors.read)
             sample = reading.to_sample()
             self.db.insert_sample(sample)
+            self.mqtt.publish(sample.as_dict())
             if self.display:
                 self.display.update(reading)
             logger.info(

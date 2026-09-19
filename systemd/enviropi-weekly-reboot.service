@@ -1,0 +1,6 @@
+[Unit]
+Description=Weekly reboot for the EnviroPi host
+
+[Service]
+Type=oneshot
+ExecStart=/sbin/reboot
